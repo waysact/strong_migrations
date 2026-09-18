@@ -196,6 +196,105 @@ class Minitest::Test
     end
   end
 
+  # hold a lock on another connection until the migration announces a lock
+  # timeout retry - the "Lock timeout" message that Checker#retry_lock_timeouts
+  # says right before it retries - then release it
+  #
+  # pass defer_until_analyze: true to take the lock only immediately before a
+  # real ANALYZE reaches the server, instead of up front - use this when the
+  # lock mode would also block an earlier statement (such as
+  # CREATE INDEX CONCURRENTLY) that needs the same lock level, so the lock
+  # must not exist yet while that earlier statement runs
+  #
+  # returns the number of retries the migration announced
+  def with_lock_released_on_retry(migration, table, mode: "ROW EXCLUSIVE", defer_until_analyze: false)
+    pool = ActiveRecord::Base.connection_pool
+    start = Queue.new
+    acquired = Queue.new
+    release = Queue.new
+    released = Queue.new
+    failure = nil
+    lock_held = false
+
+    $analyze_lock_rendezvous = {start: start, acquired: acquired} if defer_until_analyze
+
+    thread = Thread.new do
+      connection = nil
+      begin
+        go = defer_until_analyze ? start.pop : true
+        if go
+          connection = pool.checkout
+          connection.transaction do
+            connection.execute("LOCK TABLE #{connection.quote_table_name(table)} IN #{mode} MODE")
+            lock_held = true
+            acquired.push(true)
+            release.pop
+          end
+        end
+      rescue => e
+        failure = e
+        # unblock whoever is waiting on acquisition so the failure surfaces
+        # instead of hanging the run
+        acquired.push(true)
+      ensure
+        pool.checkin(connection) if connection
+        # Signal only after the transaction has ended and released its lock,
+        # so the retry cannot race the COMMIT.
+        released.push(true)
+      end
+    end
+
+    unless defer_until_analyze
+      acquired.pop
+      raise failure if failure
+    end
+
+    retry_count = 0
+    waited = false
+    # neither with_locked_table (releases only when its own block returns) nor
+    # with_lock_released_on_contention (releases once it observes the migration
+    # waiting) fits here: retry_lock_timeouts swallows the LockWaitTimeout that
+    # would otherwise prove a real timeout occurred, so the lock has to be held
+    # until that retry is announced and released right after, before the retried
+    # attempt runs
+    original_say = migration.method(:say)
+    migration.define_singleton_method(:say, proc { |message, *say_args, **say_opts|
+      original_say.call(message, *say_args, **say_opts)
+      if message.include?("Lock timeout")
+        retry_count += 1
+        release.push(true)
+        # Wait for the holder to release the lock. Waking it is not enough:
+        # these tests retry immediately because lock_timeout_retry_delay is 0.
+        #
+        # Wait only if the lock has been acquired. With defer_until_analyze,
+        # an earlier statement can time out before the holder starts. Waiting
+        # then would time out and incorrectly report that the holder failed
+        # to release its lock.
+        if lock_held && !waited
+          waited = true
+          unless released.pop(timeout: 30)
+            raise "lock holder did not end its transaction within 30 seconds"
+          end
+        end
+      end
+    })
+
+    begin
+      yield
+    ensure
+      release.push(true)
+      # unblock the holder if it never got a start signal (say was never
+      # called, e.g. the migration failed for an unrelated reason)
+      start.push(false) if defer_until_analyze
+      thread.join
+      $analyze_lock_rendezvous = nil if defer_until_analyze
+    end
+
+    raise failure if failure
+
+    retry_count
+  end
+
   def index_valid?(name)
     connection = ActiveRecord::Base.connection
     # to_regclass returns NULL for a missing index, allowing the assertion to
@@ -274,6 +373,12 @@ StrongMigrations.add_check do |method, args|
   end
 end
 
+# initialize here, at module definition time, so a test that triggers an
+# ANALYZE without going through with_analyze_failures first does not trip
+# a "not initialized" warning the first time these are read
+$analyze_attempts = 0
+$analyze_failures = 0
+
 # inject ANALYZE failures after the index build succeeds
 module AnalyzeFailures
   def analyze_table(table)
@@ -286,6 +391,24 @@ module AnalyzeFailures
   end
 end
 StrongMigrations::Adapters::PostgreSQLAdapter.prepend(AnalyzeFailures)
+
+$analyze_lock_rendezvous = nil
+
+# let with_lock_released_on_retry(defer_until_analyze: true) delay taking its
+# lock until immediately before a real ANALYZE reaches the server, then wait
+# for confirmation that the lock is actually held before letting it through -
+# consumed once, so retried ANALYZE calls pass straight through
+module AnalyzeLockRendezvous
+  def analyze_table(table)
+    if (rendezvous = $analyze_lock_rendezvous)
+      $analyze_lock_rendezvous = nil
+      rendezvous[:start].push(true)
+      rendezvous[:acquired].pop
+    end
+    super
+  end
+end
+StrongMigrations::Adapters::PostgreSQLAdapter.prepend(AnalyzeLockRendezvous)
 
 $lock_timeout_observations = nil
 

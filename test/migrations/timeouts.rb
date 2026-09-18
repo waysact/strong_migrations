@@ -160,8 +160,14 @@ class AddColumnAndNonConcurrentIndexWithAutoAnalyze < TestMigration
   end
 end
 
-
-
+# an ordinary transactional index build - CREATE INDEX takes SHARE, which
+# does not conflict with another session's SHARE lock, but the ANALYZE that
+# follows needs SHARE UPDATE EXCLUSIVE, which does
+class AddIndexNonConcurrentlyWithAutoAnalyze < TestMigration
+  def change
+    safety_assured { add_index :users, :name }
+  end
+end
 
 # remove_index checks held locks without issuing a DROP
 # User.lock takes a row lock without clearing earlier query cache entries

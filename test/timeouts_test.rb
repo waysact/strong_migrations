@@ -239,6 +239,75 @@ class TimeoutsTest < Minitest::Test
     migrate AddIndexConcurrently, direction: :down if postgresql?
   end
 
+  # test_lock_timeout_retries_analyze injects the LockWaitTimeout, which only
+  # proves where the retry block sits, not that a real timeout (with the
+  # aborted-transaction state Postgres leaves behind) is handled correctly -
+  # this is the non-transactional path: a disable_ddl_transaction! migration,
+  # so only the ANALYZE statement itself is retried, not the index build
+  def test_lock_timeout_retries_analyze_real_lock_no_ddl_transaction
+    skip unless postgresql?
+
+    migration = AddIndexConcurrently.new
+    statements = nil
+    retries = nil
+    with_auto_analyze do
+      with_lock_timeout_retries(lock: false) do
+        with_statement_timeout(NORMAL_LOCK_TIMEOUT * 20) do
+          # SHARE UPDATE EXCLUSIVE permits the concurrent build (nothing conflicts
+          # with it yet) but blocks the ANALYZE that follows - acquire the lock only
+          # once that real ANALYZE is about to run, since the build needs the same
+          # lock level and taking it any earlier would block the build too
+          retries =
+            with_lock_released_on_retry(migration, "users", mode: "SHARE UPDATE EXCLUSIVE", defer_until_analyze: true) do
+              statements = capture_statements do
+                migrate migration
+              end
+            end
+        end
+      end
+    end
+
+    assert_equal 1, retries
+    assert_equal 1, statements.count { |s| s.start_with?("CREATE INDEX") }
+  ensure
+    migrate AddIndexConcurrently, direction: :down if postgresql?
+  end
+
+  # same gap as above, for the DDL-transaction path: an ordinary transactional
+  # migration, so a real ANALYZE timeout rolls back and replays the whole
+  # transaction, unlike the non-transactional path above where only the
+  # ANALYZE statement is retried
+  def test_lock_timeout_retries_analyze_real_lock_ddl_transaction
+    skip unless postgresql?
+
+    migration = AddIndexNonConcurrentlyWithAutoAnalyze.new
+    statements = nil
+    retries = nil
+    with_auto_analyze do
+      with_lock_timeout_retries(lock: false) do
+        with_statement_timeout(NORMAL_LOCK_TIMEOUT * 20) do
+          # SHARE permits the (non-concurrent) index build, since it does not
+          # conflict with another session's SHARE lock, but blocks the ANALYZE that
+          # follows, which needs SHARE UPDATE EXCLUSIVE - the lock can be taken up
+          # front here, since it never conflicts with the build
+          retries =
+            with_lock_released_on_retry(migration, "users", mode: "SHARE") do
+              statements = capture_statements do
+                migrate migration
+              end
+            end
+        end
+      end
+    end
+
+    assert_equal 1, retries
+    # the whole transaction is rolled back and replayed, so unlike the
+    # non-transactional path, the index build itself is attempted twice
+    assert_equal 2, statements.count { |s| s.start_with?("CREATE INDEX") }
+  ensure
+    migrate AddIndexNonConcurrentlyWithAutoAnalyze, direction: :down if postgresql?
+  end
+
   # safe_by_default commits without updating Active Record's transaction count
   # retry only ANALYZE, since retrying the index build raises PG::DuplicateTable
 
