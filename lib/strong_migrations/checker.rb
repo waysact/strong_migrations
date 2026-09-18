@@ -116,7 +116,12 @@ module StrongMigrations
 
       # outdated statistics + a new index can hurt performance of existing queries
       if StrongMigrations.auto_analyze && direction == :up && adds_index?(method, *args)
-        adapter.analyze_table(args[0])
+        # retry ANALYZE separately to avoid repeating a successful index build
+        if retry_lock_timeouts?(method)
+          retry_lock_timeouts { adapter.analyze_table(args[0]) }
+        else
+          adapter.analyze_table(args[0])
+        end
       end
 
       result

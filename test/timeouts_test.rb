@@ -216,6 +216,26 @@ class TimeoutsTest < Minitest::Test
     migrate AddIndexConcurrently, direction: :down
   end
 
+  def test_lock_timeout_retries_analyze
+    skip unless postgresql?
+
+    statements = nil
+    with_auto_analyze do
+      with_analyze_failures(1) do
+        with_lock_timeout_retries(lock: false) do
+          statements = capture_statements do
+            migrate AddIndexConcurrently
+          end
+        end
+      end
+    end
+
+    assert_equal 2, $analyze_attempts
+    assert_equal 1, statements.count { |s| s.start_with?("CREATE INDEX") }
+  ensure
+    migrate AddIndexConcurrently, direction: :down if postgresql?
+  end
+
   def reset_timeouts
     StrongMigrations.lock_timeout = nil
     StrongMigrations.transaction_timeout = nil

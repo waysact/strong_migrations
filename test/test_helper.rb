@@ -67,6 +67,14 @@ class Minitest::Test
     with_option(:auto_analyze, true, &block)
   end
 
+  def with_analyze_failures(count)
+    $analyze_attempts = 0
+    $analyze_failures = count
+    yield
+  ensure
+    $analyze_failures = 0
+  end
+
   def with_safety_assured(&block)
     previous_value = StrongMigrations::Checker.safe
     begin
@@ -160,6 +168,19 @@ StrongMigrations.add_check do |method, args|
     stop! "Cannot add forbidden column"
   end
 end
+
+# inject ANALYZE failures after the index build succeeds
+module AnalyzeFailures
+  def analyze_table(table)
+    $analyze_attempts = $analyze_attempts.to_i + 1
+    if $analyze_failures.to_i > 0
+      $analyze_failures -= 1
+      raise ActiveRecord::LockWaitTimeout, "canceling statement due to lock timeout"
+    end
+    super
+  end
+end
+StrongMigrations::Adapters::PostgreSQLAdapter.prepend(AnalyzeFailures)
 
 Dir.glob("migrations/*.rb", base: __dir__).sort.each do |file|
   require_relative file

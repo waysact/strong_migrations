@@ -1,3 +1,7 @@
+## 2.9.0 (unreleased)
+
+- Added retries for `ANALYZE` when `lock_timeout_retries` is set
+
 ## 2.8.0 (2026-05-14)
 
 - Added check for `rename_enum_value`
