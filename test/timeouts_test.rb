@@ -375,11 +375,109 @@ class TimeoutsTest < Minitest::Test
   end
 
   # foreign key validation must use the normal timeout even without prior locks
-  # leave retries disabled so the observer records a single attempt
+  def test_non_blocking_lock_timeout_validate_foreign_key
+    skip unless postgresql?
 
+    add_not_valid_foreign_key
 
+    # leave retries disabled so the observer records a single attempt
+    with_option(:lock_timeout, NORMAL_LOCK_TIMEOUT) do
+      with_option(:non_blocking_lock_timeout, 0) do
+        with_statement_timeout(NORMAL_LOCK_TIMEOUT * 20) do
+          _, observations =
+            with_locked_table("users", mode: "SHARE UPDATE EXCLUSIVE") do
+              observe_validate_constraint_lock_timeout_during do
+                assert_raises(ActiveRecord::LockWaitTimeout) { migrate(ValidateForeignKeyOnly) }
+              end
+            end
+
+          assert_equal ["100ms"], observations
+        end
+      end
+    end
+  ensure
+    remove_not_valid_foreign_key if postgresql?
+  end
+
+  def test_non_blocking_lock_timeout_validate_check_constraint
+    skip unless postgresql?
+
+    connection = ActiveRecord::Base.connection
+    connection.add_check_constraint :users, "credit_score > 0", name: "credit_check_only", validate: false
+
+    with_option(:non_blocking_lock_timeout, 0) do
+      with_lock_timeout_retries(lock: false) do
+        # SHARE UPDATE EXCLUSIVE conflicts with itself
+        # hold the lock past the normal timeout to verify the override
+        result, observations =
+          with_lock_released_on_contention("users", mode: "SHARE UPDATE EXCLUSIVE", outlast: NORMAL_LOCK_TIMEOUT * 5) do
+            observe_validate_constraint_lock_timeout_during { migrate(ValidateCheckConstraintOnly) }
+          end
+        assert result
+
+        assert_equal ["0"], observations
+
+        assert_equal "100ms", connection.select_all("SHOW lock_timeout").first["lock_timeout"]
+      end
+    end
+  ensure
+    connection = ActiveRecord::Base.connection
+    connection.remove_check_constraint :users, name: "credit_check_only", if_exists: true if postgresql?
+  end
+
+  def test_non_blocking_lock_timeout_keeps_error_in_transaction
+    skip unless postgresql?
+
+    connection = ActiveRecord::Base.connection
+    connection.execute("INSERT INTO users (credit_score) VALUES (-1)")
+    connection.add_check_constraint :users, "credit_score > 0", name: "credit_check", validate: false
+
+    # use a normal timeout distinct from the override to detect a missing override
+    error, observations =
+      with_option(:lock_timeout, NORMAL_LOCK_TIMEOUT) do
+        with_option(:non_blocking_lock_timeout, 0) do
+          observe_validate_constraint_lock_timeout_during do
+            assert_raises(ActiveRecord::StatementInvalid) do
+              migrate ValidateCheckConstraintInTransaction
+            end
+          end
+        end
+      end
+
+    # restoring the timeout must not replace the error with PG::InFailedSqlTransaction
+    assert_kind_of PG::CheckViolation, error.cause
+
+    assert_equal ["0"], observations
+  ensure
+    if postgresql?
+      connection = ActiveRecord::Base.connection
+      connection.execute("DELETE FROM users WHERE credit_score = -1")
+      connection.remove_check_constraint :users, name: "credit_check", if_exists: true
+    end
+  end
 
   # restoring a SET LOCAL value with a session SET would preserve it after commit
+  def test_non_blocking_lock_timeout_transaction_commit_does_not_promote_local_timeout
+    skip unless postgresql?
+
+    connection = ActiveRecord::Base.connection
+    connection.execute("SET lock_timeout = '5s'")
+    connection.add_check_constraint :users, "credit_score > 0", name: "credit_check_local_timeout", validate: false
+
+    result, observations =
+      with_option(:non_blocking_lock_timeout, 0) do
+        observe_validate_constraint_lock_timeout_during { migrate(ValidateCheckConstraintWithLocalLockTimeout) }
+      end
+    assert result
+
+    assert_equal ["0"], observations
+
+    assert_equal "5s", connection.select_all("SHOW lock_timeout").first["lock_timeout"]
+  ensure
+    if postgresql?
+      ActiveRecord::Base.connection.remove_check_constraint :users, name: "credit_check_local_timeout", if_exists: true
+    end
+  end
 
   # dropping the invalid index nests a timeout override inside the build's override
   # cached SHOW or SET statements could restore the wrong timeout
@@ -427,12 +525,262 @@ class TimeoutsTest < Minitest::Test
     end
   end
 
+  def test_validate_foreign_key_without_option
+    skip unless postgresql?
 
-  # add_column holds ACCESS EXCLUSIVE until the transaction ends
+    add_not_valid_foreign_key
+
+    assert_raises(ActiveRecord::LockWaitTimeout) do
+      with_lock_timeout_retries(lock: false) do
+        with_statement_timeout(NORMAL_LOCK_TIMEOUT * 20) do
+          with_locked_table("users", mode: "SHARE UPDATE EXCLUSIVE") do
+            migrate ValidateForeignKeyOnly
+          end
+        end
+      end
+    end
+  ensure
+    remove_not_valid_foreign_key if postgresql?
+  end
+
+  # LOCK ... IN ACCESS EXCLUSIVE MODE holds that lock until the transaction ends
+  def test_non_blocking_lock_timeout_does_not_apply_after_access_exclusive_lock
+    skip unless postgresql?
+
+    connection = ActiveRecord::Base.connection
+    # validate a check constraint (not a foreign key) so application_blocking_lock_held?,
+    # not the unconditional foreign-key exclusion, is what denies the override
+    connection.add_check_constraint :users, "credit_score > 0", name: "credit_check_access_exclusive_lock", validate: false
+
+    with_option(:non_blocking_lock_timeout, 0) do
+      with_lock_timeout_retries(lock: false) do
+        with_statement_timeout(NORMAL_LOCK_TIMEOUT * 20) do
+          # EXCLUSIVE conflicts with the SHARE UPDATE EXCLUSIVE lock needed to validate the check constraint
+          with_locked_table("users", mode: "EXCLUSIVE") do
+            assert_raises(ActiveRecord::LockWaitTimeout) do
+              migrate LockDevicesAccessExclusiveModeThenValidateConstraint
+            end
+          end
+        end
+      end
+    end
+  ensure
+    connection = ActiveRecord::Base.connection
+    connection.remove_check_constraint :users, name: "credit_check_access_exclusive_lock", if_exists: true if postgresql?
+  end
 
   # validate_constraint must also exclude foreign keys named directly
-  # leave retries disabled so the observer records a single attempt
+  def test_non_blocking_lock_timeout_validate_constraint_by_name
+    skip unless postgresql?
 
+    add_not_valid_foreign_key(name: "review_fk")
+
+    # leave retries disabled so the observer records a single attempt
+    with_option(:lock_timeout, NORMAL_LOCK_TIMEOUT) do
+      with_option(:non_blocking_lock_timeout, 0) do
+        with_statement_timeout(NORMAL_LOCK_TIMEOUT * 20) do
+          _, observations =
+            with_locked_table("users", mode: "SHARE UPDATE EXCLUSIVE") do
+              observe_validate_constraint_lock_timeout_during do
+                assert_raises(ActiveRecord::LockWaitTimeout) { migrate(ValidateConstraintOnly) }
+              end
+            end
+
+          assert_equal ["100ms"], observations
+        end
+      end
+    end
+  ensure
+    remove_not_valid_foreign_key if postgresql?
+  end
+
+  # Postgres 18 supports NOT VALID for NOT NULL constraints. Validating them
+  # takes ACCESS EXCLUSIVE, which blocks reads and writes, so they must keep
+  # the normal lock timeout.
+  def test_non_blocking_lock_timeout_validate_constraint_not_null
+    skip unless postgresql?
+    skip if postgresql_version < 18
+
+    connection = ActiveRecord::Base.connection
+    connection.execute("ALTER TABLE users ADD CONSTRAINT city_not_null_check NOT NULL city NOT VALID")
+
+    with_option(:lock_timeout, NORMAL_LOCK_TIMEOUT) do
+      with_option(:non_blocking_lock_timeout, 0) do
+        with_statement_timeout(NORMAL_LOCK_TIMEOUT * 20) do
+          _, observations =
+            with_locked_table("users", mode: "SHARE UPDATE EXCLUSIVE") do
+              observe_validate_constraint_lock_timeout_during do
+                assert_raises(ActiveRecord::LockWaitTimeout) { migrate(ValidateConstraintNotNullOnly) }
+              end
+            end
+
+          assert_equal ["100ms"], observations
+        end
+      end
+    end
+  ensure
+    if postgresql?
+      ActiveRecord::Base.connection.execute("ALTER TABLE users DROP CONSTRAINT IF EXISTS city_not_null_check")
+    end
+  end
+
+  # The timeout override for validate_check_constraint relies on Active Record
+  # returning only check constraints. NOT NULL constraints must be excluded:
+  # validating them on Postgres 18 requires an ACCESS EXCLUSIVE lock.
+  def test_check_constraints_excludes_not_null_constraints
+    skip unless postgresql?
+    skip if postgresql_version < 18
+
+    connection = ActiveRecord::Base.connection
+    connection.execute("ALTER TABLE users ADD CONSTRAINT city_not_null_canary NOT NULL city NOT VALID")
+
+    names = connection.check_constraints("users").map(&:name)
+
+    refute_includes names, "city_not_null_canary",
+      "validate_check_constraint can now reach a constraint that needs ACCESS EXCLUSIVE"
+  ensure
+    if postgresql?
+      ActiveRecord::Base.connection.execute("ALTER TABLE users DROP CONSTRAINT IF EXISTS city_not_null_canary")
+    end
+  end
+
+  def test_non_blocking_lock_timeout_validate_constraint_naming_check_constraint
+    skip unless postgresql?
+
+    connection = ActiveRecord::Base.connection
+    connection.add_check_constraint :users, "credit_score > 0", name: "credit_check_by_name", validate: false
+
+    with_option(:non_blocking_lock_timeout, 0) do
+      with_lock_timeout_retries(lock: false) do
+        # SHARE UPDATE EXCLUSIVE conflicts with itself
+        # hold the lock past the normal timeout to verify the override
+        result, observations =
+          with_lock_released_on_contention("users", mode: "SHARE UPDATE EXCLUSIVE", outlast: NORMAL_LOCK_TIMEOUT * 5) do
+            observe_validate_constraint_lock_timeout_during { migrate(ValidateConstraintCheckConstraintOnly) }
+          end
+        assert result
+
+        assert_equal ["0"], observations
+
+        assert_equal "100ms", connection.select_all("SHOW lock_timeout").first["lock_timeout"]
+      end
+    end
+  ensure
+    connection = ActiveRecord::Base.connection
+    connection.remove_check_constraint :users, name: "credit_check_by_name", if_exists: true if postgresql?
+  end
+
+  # the checker must resolve table_name_prefix the same way Rails will,
+  # before asking the database about the constraint - otherwise the lookup
+  # targets a table that does not exist
+  def test_non_blocking_lock_timeout_validate_constraint_with_table_name_prefix
+    skip unless postgresql?
+
+    connection = ActiveRecord::Base.connection
+    connection.create_table "scratch_items", force: true do |t|
+      t.integer :amount
+    end
+    connection.add_check_constraint "scratch_items", "amount > 0", name: "predicate_check", validate: false
+
+    result, observations =
+      with_table_name_prefix("scratch_") do
+        with_option(:non_blocking_lock_timeout, 0) do
+          observe_validate_constraint_lock_timeout_during { migrate_instance(ValidateConstraintByTableName) }
+        end
+      end
+
+    assert result
+    assert_equal ["0"], observations
+  ensure
+    ActiveRecord::Base.connection.drop_table "scratch_items", if_exists: true if postgresql?
+  end
+
+  # same as above, for table_name_suffix
+  def test_non_blocking_lock_timeout_validate_constraint_with_table_name_suffix
+    skip unless postgresql?
+
+    connection = ActiveRecord::Base.connection
+    connection.create_table "items_scratch", force: true do |t|
+      t.integer :amount
+    end
+    connection.add_check_constraint "items_scratch", "amount > 0", name: "predicate_check", validate: false
+
+    result, observations =
+      with_table_name_suffix("_scratch") do
+        with_option(:non_blocking_lock_timeout, 0) do
+          observe_validate_constraint_lock_timeout_during { migrate_instance(ValidateConstraintByTableName) }
+        end
+      end
+
+    assert result
+    assert_equal ["0"], observations
+  ensure
+    ActiveRecord::Base.connection.drop_table "items_scratch", if_exists: true if postgresql?
+  end
+
+  # proper_table_name resolves a model class via its own table_name method,
+  # skipping the prefix/suffix branch entirely
+  def test_non_blocking_lock_timeout_validate_constraint_with_model_class_table_name
+    skip unless postgresql?
+
+    connection = ActiveRecord::Base.connection
+    connection.create_table "custom_named_items", force: true do |t|
+      t.integer :amount
+    end
+    connection.add_check_constraint "custom_named_items", "amount > 0", name: "predicate_check", validate: false
+
+    result, observations =
+      with_option(:non_blocking_lock_timeout, 0) do
+        observe_validate_constraint_lock_timeout_during { migrate(ValidateConstraintByModelClass) }
+      end
+
+    assert result
+    assert_equal ["0"], observations
+  ensure
+    ActiveRecord::Base.connection.drop_table "custom_named_items", if_exists: true if postgresql?
+  end
+
+  # a lookup against the wrong (unresolved) table would find a different
+  # constraint under the same name and misclassify eligibility, rather than
+  # simply fail - prove the resolved table is the one actually queried
+  def test_non_blocking_lock_timeout_validate_constraint_resolves_correct_table
+    skip unless postgresql?
+
+    connection = ActiveRecord::Base.connection
+
+    # unresolved name: a same-named constraint of a different kind
+    connection.create_table "items", force: true do |t|
+      t.bigint :order_id
+    end
+    connection.add_foreign_key "items", :orders, column: "order_id", name: "predicate_check", validate: false
+
+    # resolved name: the constraint that should actually be classified
+    connection.create_table "dual_items", force: true do |t|
+      t.integer :amount
+    end
+    connection.add_check_constraint "dual_items", "amount > 0", name: "predicate_check", validate: false
+
+    result, observations =
+      with_table_name_prefix("dual_") do
+        with_option(:lock_timeout, NORMAL_LOCK_TIMEOUT) do
+          with_option(:non_blocking_lock_timeout, 0) do
+            observe_validate_constraint_lock_timeout_during { migrate_instance(ValidateConstraintByTableName) }
+          end
+        end
+      end
+
+    assert result
+    # "0" (the override) proves the resolved table's check constraint was
+    # used; the unresolved table's foreign key would have excluded it and
+    # left the normal "100ms" timeout in place
+    assert_equal ["0"], observations
+  ensure
+    if postgresql?
+      connection = ActiveRecord::Base.connection
+      connection.drop_table "items", if_exists: true
+      connection.drop_table "dual_items", if_exists: true
+    end
+  end
 
   # verify numeric seconds with the query cache enabled
   def test_non_blocking_lock_timeout_remove_index_finite_value
@@ -649,6 +997,30 @@ class TimeoutsTest < Minitest::Test
     end
   end
 
+  # Rails resolves the table name before building the index. The checker must
+  # resolve its own copy of the argument so ANALYZE targets the same table.
+  def test_auto_analyze_resolves_table_name_prefix
+    skip unless postgresql?
+
+    connection = ActiveRecord::Base.connection
+    connection.create_table "scratch_items", force: true do |t|
+      t.integer :amount
+    end
+
+    statements = nil
+    with_table_name_prefix("scratch_") do
+      with_auto_analyze do
+        statements = capture_statements do
+          migrate_instance(AddIndexConcurrentlyByTableName)
+        end
+      end
+    end
+
+    assert_includes statements, 'ANALYZE "scratch_items"'
+  ensure
+    ActiveRecord::Base.connection.drop_table "scratch_items", if_exists: true if postgresql?
+  end
+
   # An enclosing rescue can leave $! set even when the wrapped block succeeds.
   # A failed restore must still raise, since the session keeps the override.
   def test_with_lock_timeout_raises_restore_failure_after_successful_block
@@ -825,17 +1197,143 @@ class TimeoutsTest < Minitest::Test
   end
 
   # SHARE on devices blocks writes until the transaction ends
+  def test_non_blocking_lock_timeout_does_not_apply_after_share_lock
+    skip unless postgresql?
+
+    connection = ActiveRecord::Base.connection
+    # validate a check constraint (not a foreign key) so application_blocking_lock_held?,
+    # not the unconditional foreign-key exclusion, is what denies the override
+    connection.add_check_constraint :users, "credit_score > 0", name: "credit_check_share_lock", validate: false
+
+    with_option(:non_blocking_lock_timeout, 0) do
+      with_lock_timeout_retries(lock: false) do
+        with_statement_timeout(NORMAL_LOCK_TIMEOUT * 20) do
+          # EXCLUSIVE conflicts with the SHARE UPDATE EXCLUSIVE lock needed to validate the check constraint
+          with_locked_table("users", mode: "EXCLUSIVE") do
+            assert_raises(ActiveRecord::LockWaitTimeout) do
+              migrate LockDevicesShareModeThenValidateConstraint
+            end
+          end
+        end
+      end
+    end
+  ensure
+    connection = ActiveRecord::Base.connection
+    connection.remove_check_constraint :users, name: "credit_check_share_lock", if_exists: true if postgresql?
+  end
 
   # EXCLUSIVE on devices blocks writes until the transaction ends
+  def test_non_blocking_lock_timeout_does_not_apply_after_exclusive_lock
+    skip unless postgresql?
+
+    connection = ActiveRecord::Base.connection
+    # validate a check constraint (not a foreign key) so application_blocking_lock_held?,
+    # not the unconditional foreign-key exclusion, is what denies the override
+    connection.add_check_constraint :users, "credit_score > 0", name: "credit_check_exclusive_lock", validate: false
+
+    with_option(:non_blocking_lock_timeout, 0) do
+      with_lock_timeout_retries(lock: false) do
+        with_statement_timeout(NORMAL_LOCK_TIMEOUT * 20) do
+          # EXCLUSIVE conflicts with the SHARE UPDATE EXCLUSIVE lock needed to validate the check constraint
+          with_locked_table("users", mode: "EXCLUSIVE") do
+            assert_raises(ActiveRecord::LockWaitTimeout) do
+              migrate LockDevicesExclusiveModeThenValidateConstraint
+            end
+          end
+        end
+      end
+    end
+  ensure
+    connection = ActiveRecord::Base.connection
+    connection.remove_check_constraint :users, name: "credit_check_exclusive_lock", if_exists: true if postgresql?
+  end
 
   # UPDATE holds row locks until the transaction ends
   # validation must keep the normal timeout while those locks block other writers
+  def test_non_blocking_lock_timeout_does_not_apply_after_row_lock
+    skip unless postgresql?
+
+    connection = ActiveRecord::Base.connection
+    connection.execute("INSERT INTO users (credit_score) VALUES (1)")
+    connection.add_check_constraint :users, "credit_score > 0", name: "credit_check_row_lock", validate: false
+
+    lock_timeout = 0.05
+    with_option(:lock_timeout, lock_timeout) do
+      with_option(:lock_timeout_retries, 0) do
+        with_option(:non_blocking_lock_timeout, 0) do
+          with_statement_timeout(lock_timeout * 20) do
+            with_locked_table("users", mode: "SHARE UPDATE EXCLUSIVE") do
+              assert_raises(ActiveRecord::LockWaitTimeout) do
+                migrate UpdateCreditScoreThenValidateCheckConstraint
+              end
+            end
+          end
+        end
+      end
+    end
+  ensure
+    if postgresql?
+      connection = ActiveRecord::Base.connection
+      connection.remove_check_constraint :users, name: "credit_check_row_lock", if_exists: true
+      connection.execute("DELETE FROM users WHERE credit_score IN (1, 2)")
+    end
+  end
 
   # locking reads preserve earlier query cache entries, while UPDATE clears them
   # keep this test separate from the UPDATE case to cover stale lock queries
+  def test_non_blocking_lock_timeout_does_not_apply_after_cached_guard_row_lock
+    skip unless postgresql?
+
+    connection = ActiveRecord::Base.connection
+    connection.execute("INSERT INTO users (credit_score) VALUES (1)")
+    connection.add_check_constraint :users, "credit_score > 0", name: "credit_check_cached_guard_row_lock", validate: false
+
+    lock_timeout = 0.05
+    with_option(:lock_timeout, lock_timeout) do
+      with_option(:lock_timeout_retries, 0) do
+        with_option(:non_blocking_lock_timeout, 0) do
+          with_statement_timeout(lock_timeout * 20) do
+            with_locked_table("users", mode: "SHARE UPDATE EXCLUSIVE") do
+              assert_raises(ActiveRecord::LockWaitTimeout) do
+                migrate ValidateCheckConstraintAfterCachedGuardRowLock
+              end
+            end
+          end
+        end
+      end
+    end
+  ensure
+    if postgresql?
+      connection = ActiveRecord::Base.connection
+      connection.remove_check_constraint :users, name: "credit_check_cached_guard_row_lock", if_exists: true
+      connection.execute("DELETE FROM users WHERE credit_score = 1")
+    end
+  end
 
   # foreign key validation leaves ROW SHARE on the referenced table
   # that lock also prevents the later check validation from using the override
+  def test_non_blocking_lock_timeout_does_not_apply_after_foreign_key_validation_in_same_transaction
+    skip unless postgresql?
+
+    add_not_valid_foreign_key
+    connection = ActiveRecord::Base.connection
+    connection.add_check_constraint :users, "credit_score > 0", name: "credit_check_after_fk", validate: false
+
+    result, observations =
+      with_option(:lock_timeout, NORMAL_LOCK_TIMEOUT) do
+        with_option(:non_blocking_lock_timeout, 0) do
+          observe_validate_constraint_lock_timeout_during { migrate(ValidateForeignKeyThenValidateCheckConstraint) }
+        end
+      end
+    assert result
+
+    assert_equal ["100ms", "100ms"], observations
+  ensure
+    if postgresql?
+      remove_not_valid_foreign_key
+      ActiveRecord::Base.connection.remove_check_constraint :users, name: "credit_check_after_fk", if_exists: true
+    end
+  end
 
   def reset_timeouts
     StrongMigrations.lock_timeout = nil
@@ -896,5 +1394,47 @@ class TimeoutsTest < Minitest::Test
     assert_retries(migration, retries: 0, **options)
   end
 
+  def add_not_valid_foreign_key(name: nil)
+    options = {validate: false}
+    options[:name] = name if name
+    ActiveRecord::Base.connection.add_foreign_key :users, :orders, **options
+  end
 
+  def remove_not_valid_foreign_key
+    connection = ActiveRecord::Base.connection
+    connection.remove_foreign_key :users, :orders if connection.foreign_key_exists?(:users, :orders)
+  end
+
+  # run a migration directly, bypassing the shared schema_migrations bookkeeping
+  # that the migrate() helper does - table_name_prefix/suffix rename that table too,
+  # so it stops existing for the duration of a with_table_name_prefix/suffix block
+  def migrate_instance(migration_class, version: 123)
+    migration = migration_class.new
+    migration.version = version
+    migration.migrate(:up)
+    true
+  rescue => e
+    raise e.cause || e
+  end
+
+  # table_name_prefix and table_name_suffix are global, so save and restore them
+  def with_table_name_prefix(prefix)
+    previous_value = ActiveRecord::Base.table_name_prefix
+    begin
+      ActiveRecord::Base.table_name_prefix = prefix
+      yield
+    ensure
+      ActiveRecord::Base.table_name_prefix = previous_value
+    end
+  end
+
+  def with_table_name_suffix(suffix)
+    previous_value = ActiveRecord::Base.table_name_suffix
+    begin
+      ActiveRecord::Base.table_name_suffix = suffix
+      yield
+    ensure
+      ActiveRecord::Base.table_name_suffix = previous_value
+    end
+  end
 end

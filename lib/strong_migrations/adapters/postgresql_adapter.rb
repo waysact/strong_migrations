@@ -244,6 +244,19 @@ module StrongMigrations
         connection.check_constraints(table).select { |c| /\b#{Regexp.escape(column.to_s)}\b/.match?(c.expression) }
       end
 
+      # returns pg_constraint.contype, or nil if the constraint or table does not exist
+      def constraint_type(table, name)
+        # to_regclass returns NULL instead of raising for a name that does not resolve -
+        # an eligibility check must never be what breaks a migration
+        query = <<~SQL
+          SELECT contype
+          FROM pg_constraint
+          WHERE conrelid = to_regclass(#{connection.quote(connection.quote_table_name(table.to_s))})
+            AND conname = #{connection.quote(name.to_s)}
+        SQL
+        # bypass the query cache so each statement checks the current constraint type
+        connection.uncached { select_all(query.squish) }.first&.fetch("contype")
+      end
 
       # The name distinguishes the server's state from the Active Record
       # count checked by SafeMethods#in_transaction?; Checker uses both methods.

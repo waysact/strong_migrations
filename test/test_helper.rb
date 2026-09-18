@@ -333,6 +333,13 @@ class Minitest::Test
 
   # return [block_result, observations] with one server timeout reading
   # per validate_constraint call, including foreign key and check validation
+  def observe_validate_constraint_lock_timeout_during
+    $validate_constraint_lock_timeouts = []
+    result = yield
+    [result, $validate_constraint_lock_timeouts]
+  ensure
+    $validate_constraint_lock_timeouts = nil
+  end
 
   def capture_statements
     statements = []
@@ -424,6 +431,19 @@ module LockTimeoutDuringObserver
 end
 StrongMigrations::Adapters::PostgreSQLAdapter.prepend(LockTimeoutDuringObserver)
 
+$validate_constraint_lock_timeouts = nil
+
+# both validate_foreign_key and validate_check_constraint call this method
+# read the server timeout just before validation
+module ValidateConstraintLockTimeoutObserver
+  def validate_constraint(table_name, constraint_name)
+    $validate_constraint_lock_timeouts << uncached { select_all("SHOW lock_timeout") }.first["lock_timeout"] if $validate_constraint_lock_timeouts
+    super
+  end
+end
+if defined?(ActiveRecord::ConnectionAdapters::PostgreSQLAdapter)
+  ActiveRecord::ConnectionAdapters::PostgreSQLAdapter.prepend(ValidateConstraintLockTimeoutObserver)
+end
 
 Dir.glob("migrations/*.rb", base: __dir__).sort.each do |file|
   require_relative file

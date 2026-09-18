@@ -284,6 +284,18 @@ module StrongMigrations
         case method
         when :add_index, :remove_index
           args.last.is_a?(Hash) && args.last[:algorithm] == :concurrently
+        when :validate_check_constraint
+          # check constraint validation takes no row locks
+          #
+          # No constraint type check is needed: Active Record resolves the name
+          # through check_constraints, which returns only check constraints
+          # (contype "c"). A regression test verifies this assumption.
+          true
+        when :validate_foreign_key
+          # foreign key validation can take row locks after the eligibility check
+          # Postgres may check rows individually for restricted SELECT permissions,
+          # row-level security, or temporal constraints, so exclude all foreign keys
+          false
         when :analyze
           # ANALYZE takes a SHARE UPDATE EXCLUSIVE lock.
           #
@@ -291,6 +303,14 @@ module StrongMigrations
           # non-concurrent add_index skips the lock check and holds an ACCESS
           # EXCLUSIVE lock until the transaction ends.
           true
+        when :validate_constraint
+          # Apply the override only to check constraints, the only kind verified
+          # to need no lock stronger than SHARE UPDATE EXCLUSIVE for validation.
+          #
+          # Foreign key validation takes row locks. Postgres 18 validates NOT
+          # NULL constraints (contype n) under ACCESS EXCLUSIVE. Any constraint
+          # kinds added later must be reviewed before receiving the override.
+          adapter.constraint_type(resolved_table_name(args[0]), args[1]) == "c"
         else
           false
         end

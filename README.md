@@ -986,16 +986,25 @@ Set a separate lock timeout for non-blocking statements with:
 StrongMigrations.non_blocking_lock_timeout = 0
 ```
 
-Use seconds or a Postgres duration string, like `"2s"`. Set `0` for no lock timeout. The default is `nil`, which keeps the normal `lock_timeout`. This option applies to:
+Specify the timeout as a number of seconds or a Postgres duration string, such as `"2s"`. Postgres interprets strings without a unit as milliseconds. Set the timeout to `0` to disable it, or leave it at the default, `nil`, to keep the normal `lock_timeout`.
+
+This option applies only to PostgreSQL; MySQL and MariaDB ignore it. It covers:
 
 - `add_index` and `remove_index` with `algorithm: :concurrently`
+- `validate_check_constraint` and `validate_constraint` for check constraints
 - `ANALYZE` after adding an index with `auto_analyze` enabled
 
 This option does not apply to `add_reference` with `index: {algorithm: :concurrently}`, since adding the column blocks reads and writes. The subsequent `ANALYZE` can still use this option.
 
+Foreign key validation can take row locks, so `validate_foreign_key` and `validate_constraint` for foreign keys always use the normal `lock_timeout`. The `lock_timeout_retries` option still applies.
+
+Note: Setting this option to `0` disables lock timeouts, so `lock_timeout_retries` cannot retry the statement. If `statement_timeout` is set, Postgres cancels the statement when that limit is reached. This query timeout is not retried, and canceling a concurrent index build leaves an invalid index. Use a positive lock timeout shorter than `statement_timeout` to allow lock timeout retries.
+
 Note: These statements hold `SHARE UPDATE EXCLUSIVE`, which blocks DDL that needs `ACCESS EXCLUSIVE`. Application queries can queue behind that DDL, so a finite timeout can still help.
 
 Note: This option does not support connection poolers like PgBouncer in transaction mode. Setting, using, and restoring the timeout can happen on different connections. The override may not apply or may remain on a pooled connection.
+
+Note: Statements also keep the normal timeout if the transaction already holds locks that can block application queries. Foreign key validation leaves a `ROW SHARE` lock until the transaction ends, which also prevents later statements from using this option.
 
 ## App Timeouts
 

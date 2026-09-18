@@ -109,12 +109,57 @@ class CheckLockTimeoutAfterConcurrentIndex < TestMigration
   end
 end
 
+class ValidateForeignKeyOnly < TestMigration
+  disable_ddl_transaction!
 
+  def up
+    validate_foreign_key :users, :orders
+  end
+end
 
+class LockDevicesAccessExclusiveModeThenValidateConstraint < TestMigration
+  def up
+    connection.execute("LOCK devices IN ACCESS EXCLUSIVE MODE")
+    validate_constraint :users, "credit_check_access_exclusive_lock"
+  end
+end
 
+class ValidateConstraintOnly < TestMigration
+  def up
+    validate_constraint :users, "review_fk"
+  end
+end
 
+class ValidateConstraintCheckConstraintOnly < TestMigration
+  def up
+    validate_constraint :users, "credit_check_by_name"
+  end
+end
 
+class ValidateConstraintNotNullOnly < TestMigration
+  def up
+    validate_constraint :users, "city_not_null_check"
+  end
+end
 
+class ValidateCheckConstraintInTransaction < TestMigration
+  def up
+    validate_check_constraint :users, name: "credit_check"
+  end
+end
+
+class ValidateCheckConstraintOnly < TestMigration
+  def up
+    validate_check_constraint :users, name: "credit_check_only"
+  end
+end
+
+class ValidateCheckConstraintWithLocalLockTimeout < TestMigration
+  def up
+    connection.execute("SET LOCAL lock_timeout = '1s'")
+    validate_check_constraint :users, name: "credit_check_local_timeout"
+  end
+end
 
 class AddUniqueIndexConcurrentlyDupCheck < TestMigration
   disable_ddl_transaction!
@@ -169,6 +214,70 @@ class AddIndexNonConcurrentlyWithAutoAnalyze < TestMigration
   end
 end
 
+class LockDevicesShareModeThenValidateConstraint < TestMigration
+  def up
+    connection.execute("LOCK devices IN SHARE MODE")
+    validate_constraint :users, "credit_check_share_lock"
+  end
+end
+
+class LockDevicesExclusiveModeThenValidateConstraint < TestMigration
+  def up
+    connection.execute("LOCK devices IN EXCLUSIVE MODE")
+    validate_constraint :users, "credit_check_exclusive_lock"
+  end
+end
+
+class UpdateCreditScoreThenValidateCheckConstraint < TestMigration
+  def up
+    safety_assured { execute "UPDATE users SET credit_score = 2 WHERE credit_score = 1" }
+    validate_check_constraint :users, name: "credit_check_row_lock"
+  end
+end
+
 # remove_index checks held locks without issuing a DROP
 # User.lock takes a row lock without clearing earlier query cache entries
+class ValidateCheckConstraintAfterCachedGuardRowLock < TestMigration
+  def up
+    connection.cache do
+      remove_index :users, name: "cached_guard_nonexistent_index", algorithm: :concurrently, if_exists: true
+      User.lock.first
+      validate_check_constraint :users, name: "credit_check_cached_guard_row_lock"
+    end
+  end
+end
 
+class ValidateForeignKeyThenValidateCheckConstraint < TestMigration
+  def up
+    validate_foreign_key :users, :orders
+    validate_check_constraint :users, name: "credit_check_after_fk"
+  end
+end
+
+# the checker sees this unresolved logical name (:items); Rails applies
+# table_name_prefix/table_name_suffix, or a model class's table_name,
+# afterwards in ActiveRecord::Migration#method_missing
+class ValidateConstraintByTableName < TestMigration
+  def up
+    validate_constraint :items, "predicate_check"
+  end
+end
+
+# a model class whose table_name differs from its inferred name
+class ItemWithCustomTableName < ActiveRecord::Base
+  self.table_name = "custom_named_items"
+end
+
+class ValidateConstraintByModelClass < TestMigration
+  def up
+    validate_constraint ItemWithCustomTableName, "predicate_check"
+  end
+end
+
+class AddIndexConcurrentlyByTableName < TestMigration
+  disable_ddl_transaction!
+
+  def up
+    add_index :items, :amount, algorithm: :concurrently
+  end
+end
