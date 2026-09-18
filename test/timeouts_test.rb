@@ -310,6 +310,120 @@ class TimeoutsTest < Minitest::Test
 
   # safe_by_default commits without updating Active Record's transaction count
   # retry only ANALYZE, since retrying the index build raises PG::DuplicateTable
+  def test_lock_timeout_retries_analyze_safe_by_default
+    skip unless postgresql?
+
+    statements = nil
+    with_option(:safe_by_default, true) do
+      with_auto_analyze do
+        with_analyze_failures(1) do
+          with_lock_timeout_retries(lock: false) do
+            statements = capture_statements do
+              migrate AddIndexSafeByDefault
+            end
+          end
+        end
+      end
+    end
+
+    assert_equal 2, $analyze_attempts
+    assert_equal 1, statements.count { |s| s.start_with?("CREATE INDEX") }
+  ensure
+    migrate AddIndexSafeByDefault, direction: :down if postgresql?
+  end
+
+  # safe_change_column_null opens a real transaction (connection.begin_db_transaction)
+  # after safe_by_default's raw commit - a lock timeout on change_column_null inside
+  # that real transaction must surface as ActiveRecord::LockWaitTimeout, not
+  # PG::InFailedSqlTransaction from a statement retried against an aborted transaction
+  def test_lock_timeout_retries_change_column_null_real_transaction
+    skip unless postgresql?
+
+    connection = ActiveRecord::Base.connection
+    # created outside the migration and the lock hold, so a migration-level
+    # retry does not also have to redo (and re-lock on) adding it
+    connection.execute('ALTER TABLE "users" ADD CONSTRAINT "users_name_null" CHECK ("name" IS NOT NULL) NOT VALID')
+
+    with_option(:safe_by_default, true) do
+      with_statement_timeout(NORMAL_LOCK_TIMEOUT * 20) do
+        with_lock_timeout_retries do
+          error = assert_raises(ActiveRecord::LockWaitTimeout) do
+            migrate ChangeColumnNullLockTimeout
+          end
+          refute_kind_of PG::InFailedSqlTransaction, error.cause
+        end
+      end
+    end
+  ensure
+    if postgresql?
+      connection = ActiveRecord::Base.connection
+      name_column = connection.columns(:users).find { |c| c.name == "name" }
+      connection.change_column_null :users, :name, true if name_column && !name_column.null
+      connection.execute('ALTER TABLE "users" DROP CONSTRAINT IF EXISTS "users_name_null"')
+    end
+  end
+
+  # the regression above holds the lock for the whole migration, so its assertion
+  # still passes if migration-level retries stop working - the first timeout
+  # raises the same exception class - so also release the lock when the first
+  # retry is announced and require the migration to finish, which happens only
+  # if the whole migration, including the raw transaction, is replayed
+  def test_lock_timeout_retries_change_column_null_real_transaction_succeeds
+    skip unless postgresql?
+
+    connection = ActiveRecord::Base.connection
+    # created outside the migration and the lock hold, so a migration-level
+    # retry does not also have to redo (and re-lock on) adding it
+    connection.execute('ALTER TABLE "users" ADD CONSTRAINT "users_name_null" CHECK ("name" IS NOT NULL) NOT VALID')
+
+    migration = ChangeColumnNullLockTimeout.new
+    retries = nil
+    with_option(:safe_by_default, true) do
+      with_statement_timeout(NORMAL_LOCK_TIMEOUT * 20) do
+        with_lock_timeout_retries(lock: false) do
+          # ROW EXCLUSIVE does not conflict with the constraint validation, so
+          # the timeout happens on the SET NOT NULL inside the raw transaction
+          retries =
+            with_lock_released_on_retry(migration, "users") do
+              assert migrate(migration)
+            end
+        end
+      end
+    end
+
+    assert_equal 1, retries
+    refute ActiveRecord::Base.connection.columns(:users).find { |c| c.name == "name" }.null
+  ensure
+    if postgresql?
+      connection = ActiveRecord::Base.connection
+      name_column = connection.columns(:users).find { |c| c.name == "name" }
+      connection.change_column_null :users, :name, true if name_column && !name_column.null
+      connection.execute('ALTER TABLE "users" DROP CONSTRAINT IF EXISTS "users_name_null"')
+    end
+  end
+
+  # an ordinary Active Record transaction opened after safe_by_default's raw commit
+  # a lock timeout on a statement inside it must not be retried there either
+  def test_lock_timeout_retries_transaction_after_safe_by_default_commit
+    skip unless postgresql?
+
+    # pre-create the index so CREATE INDEX CONCURRENTLY IF NOT EXISTS has
+    # nothing to build, and its cross-transaction wait cannot itself compete
+    # with the lock held for the second transaction below
+    ActiveRecord::Base.connection.add_index :users, :name, algorithm: :concurrently, if_not_exists: true
+
+    with_option(:safe_by_default, true) do
+      with_statement_timeout(NORMAL_LOCK_TIMEOUT * 20) do
+        refute_retries SafeAddIndexThenTransactionLockTimeout
+      end
+    end
+  ensure
+    if postgresql?
+      connection = ActiveRecord::Base.connection
+      connection.remove_column :users, :retry_probe, if_exists: true
+      connection.remove_index :users, :name, if_exists: true, algorithm: :concurrently
+    end
+  end
 
   def test_non_blocking_lock_timeout_add_index
     skip unless postgresql?
@@ -994,6 +1108,29 @@ class TimeoutsTest < Minitest::Test
     if postgresql?
       StrongMigrations.checks.pop
       migrate AddIndexConcurrently, direction: :down
+    end
+  end
+
+  # safe_by_default commits the DDL transaction without updating Active Record's
+  # transaction count. This enables statement-level retries. Once those retries
+  # are exhausted, migration-level retries must stop to avoid repeating them.
+  def test_lock_timeout_retries_do_not_stack_after_safe_by_default_commit
+    skip unless postgresql?
+
+    connection = ActiveRecord::Base.connection
+    connection.execute('ALTER TABLE "users" ADD CONSTRAINT "credit_check_safe_by_default" CHECK ("credit_score" > 0) NOT VALID')
+
+    with_option(:safe_by_default, true) do
+      with_statement_timeout(NORMAL_LOCK_TIMEOUT * 40) do
+        # SHARE UPDATE EXCLUSIVE conflicts with the lock validation needs.
+        with_locked_table("users", mode: "SHARE UPDATE EXCLUSIVE") do
+          assert_retries AddCheckConstraintSafeByDefault, lock: false
+        end
+      end
+    end
+  ensure
+    if postgresql?
+      ActiveRecord::Base.connection.execute('ALTER TABLE "users" DROP CONSTRAINT IF EXISTS "credit_check_safe_by_default"')
     end
   end
 

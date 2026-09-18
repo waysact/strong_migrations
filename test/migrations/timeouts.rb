@@ -96,6 +96,38 @@ class CheckLockTimeoutRetriesCommitDbTransaction < TestMigration
   end
 end
 
+# safe_change_column_null opens a real transaction (connection.begin_db_transaction)
+# after safe_by_default's raw commit; a lock timeout on change_column_null inside
+# that real transaction must not be retried there. the matching NOT VALID check
+# constraint is created by the test, outside the DDL transaction, so retrying
+# the whole migration does not also have to redo (and re-lock on) adding it
+class ChangeColumnNullLockTimeout < TestMigration
+  def up
+    change_column_null :users, :name, false
+  end
+
+  def down
+    change_column_null :users, :name, true
+  end
+end
+
+# an ordinary Active Record transaction opened after safe_by_default's raw commit
+# (inside the first transaction block, whose exit resyncs Active Record's
+# transaction count back to zero) - a lock timeout on a statement inside the
+# second, genuinely-real transaction must not be retried there either
+class SafeAddIndexThenTransactionLockTimeout < TestMigration
+  disable_ddl_transaction!
+
+  def change
+    transaction do
+      add_index :users, :name, if_not_exists: true
+    end
+    transaction do
+      safety_assured { add_column :users, :retry_probe, :boolean, if_not_exists: true }
+    end
+  end
+end
+
 class CheckLockTimeoutAfterConcurrentIndex < TestMigration
   disable_ddl_transaction!
 
@@ -279,5 +311,11 @@ class AddIndexConcurrentlyByTableName < TestMigration
 
   def up
     add_index :items, :amount, algorithm: :concurrently
+  end
+end
+
+class AddCheckConstraintSafeByDefault < TestMigration
+  def up
+    add_check_constraint :users, "credit_score > 0", name: "credit_check_safe_by_default"
   end
 end

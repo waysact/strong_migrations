@@ -19,6 +19,7 @@ module StrongMigrations
       @new_columns = []
       @timeouts_set = false
       @committed = false
+      @statement_retries_exhausted = false
       @transaction_disabled = false
       @skip_retries = false
     end
@@ -136,18 +137,23 @@ module StrongMigrations
       yield
     end
 
+    # check_committed identifies retries that replay the whole migration.
     def retry_lock_timeouts(check_committed: false)
       retries = 0
       begin
         yield
       rescue ActiveRecord::LockWaitTimeout => e
-        if retries < StrongMigrations.lock_timeout_retries && !(check_committed && @committed)
+        # Stop migration-level retries once statement-level retries are exhausted.
+        # Replaying would repeat the same waits and any DDL already committed directly.
+        exhausted = check_committed && (@committed || @statement_retries_exhausted)
+        if retries < StrongMigrations.lock_timeout_retries && !exhausted
           retries += 1
           delay = StrongMigrations.lock_timeout_retry_delay
           @migration.say("Lock timeout. Retrying in #{delay} seconds...")
           sleep(delay)
           retry
         end
+        @statement_retries_exhausted = true unless check_committed
         raise e
       end
     end
@@ -267,12 +273,15 @@ module StrongMigrations
     def retry_lock_timeouts?(method)
       (
         StrongMigrations.lock_timeout_retries > 0 &&
-        !in_transaction? &&
+        # ask the adapter, not Active Record's counter, whether the server is
+        # inside a transaction - a raw commit (from safe_by_default) or a raw
+        # begin_db_transaction leaves Active Record's counter unchanged, so only
+        # the server's own answer is reliable here
+        !adapter.server_in_transaction? &&
         method != :transaction &&
         !@skip_retries
       )
     end
-
 
     # Return whether the operation is eligible for the non-blocking timeout.
     def non_blocking?(method, args)
