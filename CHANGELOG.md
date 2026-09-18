@@ -1,5 +1,6 @@
 ## 2.9.0 (unreleased)
 
+- Added experimental `non_blocking_lock_timeout` option
 - Added retries for `ANALYZE` when `lock_timeout_retries` is set
 
 ## 2.8.0 (2026-05-14)

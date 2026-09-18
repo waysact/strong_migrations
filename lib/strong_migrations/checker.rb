@@ -41,6 +41,10 @@ module StrongMigrations
       set_timeouts
       check_lock_timeout
 
+      # Custom checks can remove the options hash from args with
+      # extract_options!, so copy the array before choosing the timeout.
+      timeout_args = args.dup
+
       if !safe? || safe_by_default_method?(method)
         # TODO better pattern
         # see checks.rb for methods
@@ -105,22 +109,20 @@ module StrongMigrations
       end
 
       result =
-        if retry_lock_timeouts?(method)
+        with_lock_timeout_for(method, timeout_args) do
           # TODO figure out how to handle methods that generate multiple statements
           # like add_reference(table, ref, index: {algorithm: :concurrently})
           # lock timeout after first statement will cause retry to fail
-          retry_lock_timeouts { perform_method(method, *args, &block) }
-        else
-          perform_method(method, *args, &block)
+          maybe_retry_lock_timeouts(method) { perform_method(method, *args, &block) }
         end
 
       # outdated statistics + a new index can hurt performance of existing queries
       if StrongMigrations.auto_analyze && direction == :up && adds_index?(method, *args)
-        # retry ANALYZE separately to avoid repeating a successful index build
-        if retry_lock_timeouts?(method)
-          retry_lock_timeouts { adapter.analyze_table(args[0]) }
-        else
-          adapter.analyze_table(args[0])
+        table = resolved_table_name(args[0])
+        # apply the ANALYZE timeout separately so add_reference keeps its normal timeout
+        with_lock_timeout_for(:analyze, [table]) do
+          # retry ANALYZE separately to avoid repeating a successful index build
+          maybe_retry_lock_timeouts(method) { adapter.analyze_table(table) }
         end
       end
 
@@ -148,6 +150,12 @@ module StrongMigrations
         end
         raise e
       end
+    end
+
+    def maybe_retry_lock_timeouts(method, &block)
+      return yield unless retry_lock_timeouts?(method)
+
+      retry_lock_timeouts(&block)
     end
 
     def version_safe?
@@ -211,6 +219,9 @@ module StrongMigrations
       return if defined?(@lock_timeout_checked)
 
       if StrongMigrations.lock_timeout_limit
+        # Check before applying any per-statement override. Longer or unlimited
+        # waits configured through non_blocking_lock_timeout intentionally do
+        # not trigger this warning.
         adapter.check_lock_timeout(StrongMigrations.lock_timeout_limit)
       end
 
@@ -260,6 +271,57 @@ module StrongMigrations
         method != :transaction &&
         !@skip_retries
       )
+    end
+
+
+    # Return whether the operation is eligible for the non-blocking timeout.
+    def non_blocking?(method, args)
+      return false unless postgresql?
+
+      # these statements hold SHARE UPDATE EXCLUSIVE, which permits reads and writes
+      # queued DDL can still block application queries while waiting for this lock
+      non_blocking =
+        case method
+        when :add_index, :remove_index
+          args.last.is_a?(Hash) && args.last[:algorithm] == :concurrently
+        when :analyze
+          # ANALYZE takes a SHARE UPDATE EXCLUSIVE lock.
+          #
+          # Check for blocking locks again before ANALYZE. A preceding
+          # non-concurrent add_index skips the lock check and holds an ACCESS
+          # EXCLUSIVE lock until the transaction ends.
+          true
+        else
+          false
+        end
+
+      # earlier statements can hold blocking locks until the transaction ends
+      non_blocking && !adapter.application_blocking_lock_held?
+    end
+
+    # Resolve table_name_prefix/suffix or a model class's table_name as Rails
+    # does.
+    def resolved_table_name(table)
+      # Skip resolution when recording commands, matching Rails.
+      return table if recording?
+
+      # ActiveRecord::Migration#method_missing resolves its own copy of the
+      # arguments later, so the checker still receives the original table name.
+      @migration.proper_table_name(table, @migration.table_name_options)
+    end
+
+    # Run the block with the non-blocking timeout when configured and eligible.
+    def with_lock_timeout_for(method, args, &block)
+      timeout = StrongMigrations.non_blocking_lock_timeout
+      # Recorded commands execute during replay, when they receive their own
+      # timeout override.
+      return yield if timeout.nil? || recording? || !non_blocking?(method, args)
+
+      adapter.with_lock_timeout(timeout, &block)
+    end
+
+    def recording?
+      connection.respond_to?(:revert)
     end
 
     def without_retries

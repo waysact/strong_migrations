@@ -101,13 +101,15 @@ class Minitest::Test
     ActiveRecord::Base.connection.execute("RESET lock_timeout")
   end
 
-  def with_locked_table(table)
+  # hold a lock on another connection until the block exits
+  # use for timeout assertions so releasing the lock cannot race the assertion
+  def with_locked_table(table, mode: "ROW EXCLUSIVE")
     pool = ActiveRecord::Base.connection_pool
     connection = pool.checkout
 
     if postgresql?
       connection.transaction do
-        connection.execute("LOCK TABLE #{connection.quote_table_name(table)} IN ROW EXCLUSIVE MODE")
+        connection.execute("LOCK TABLE #{connection.quote_table_name(table)} IN #{mode} MODE")
         yield
       end
     else
@@ -120,6 +122,88 @@ class Minitest::Test
     end
   ensure
     pool.checkin(connection) if connection
+  end
+
+  # bound the wait if a lock timeout fails to fire
+  # use a multiple of lock_timeout so a regression raises QueryCanceled
+  # instead of hanging, while a passing test raises LockWaitTimeout
+  def with_statement_timeout(seconds)
+    connection = ActiveRecord::Base.connection
+    connection.execute("SET statement_timeout = #{(seconds * 1000).ceil}")
+    yield
+  ensure
+    connection.execute("RESET statement_timeout")
+  end
+
+  # release the lock after the migration waits for outlast seconds
+  # set outlast above lock_timeout to verify the timeout override
+  # fail if no wait starts within ceiling seconds
+  def with_lock_released_on_contention(table, outlast:, mode: "ROW EXCLUSIVE", ceiling: 15)
+    waiter_pid = ActiveRecord::Base.connection.select_all("SELECT pg_backend_pid() AS pid").first["pid"].to_i
+    pool = ActiveRecord::Base.connection_pool
+    held = Queue.new
+    thread = Thread.new do
+      locked = false
+      connection = nil
+      begin
+        connection = pool.checkout
+        connection.transaction do
+          connection.execute("LOCK TABLE #{connection.quote_table_name(table)} IN #{mode} MODE")
+          held.push(true)
+          locked = true
+          wait_for_lock_contention(connection, waiter_pid, ceiling: ceiling)
+          sleep(outlast)
+        end
+      ensure
+        pool.checkin(connection) if connection
+        # unblock the main thread if acquiring the lock fails
+        # Thread#join propagates the error
+        held.push(false) unless locked
+      end
+    end
+
+    unless held.pop
+      thread.join
+      raise "lock holder exited without taking the lock on #{table}"
+    end
+
+    yield
+  ensure
+    # preserve the migration error if the lock holder also fails
+    in_flight = $!
+    begin
+      thread&.join
+    rescue StandardError
+      raise unless in_flight
+    end
+  end
+
+  def wait_for_lock_contention(connection, waiter_pid, ceiling:)
+    deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + ceiling
+    # observe pg_stat_activity to detect both table and virtual transaction waits
+    query = <<~SQL
+      SELECT 1
+      FROM pg_stat_activity
+      WHERE pid = #{waiter_pid}
+        AND wait_event_type = 'Lock'
+    SQL
+    loop do
+      return if connection.select_all(query).any?
+      if Process.clock_gettime(Process::CLOCK_MONOTONIC) >= deadline
+        raise "migration backend (pid #{waiter_pid}) was never observed waiting on a lock within #{ceiling}s"
+      end
+      sleep(0.05)
+    end
+  end
+
+  def index_valid?(name)
+    connection = ActiveRecord::Base.connection
+    # to_regclass returns NULL for a missing index, allowing the assertion to
+    # report a failure instead of raising a database error.
+    row = connection.select_all(
+      "SELECT indisvalid FROM pg_index WHERE indexrelid = to_regclass(#{connection.quote(name)})"
+    ).first
+    row && row["indisvalid"]
   end
 
   def assert_analyzed(migration)
@@ -137,6 +221,19 @@ class Minitest::Test
     migrate migration, direction: :down
     statements.any? { |s| s.start_with?("ANALYZE") }
   end
+
+  # return [block_result, observations] with one server timeout reading
+  # per with_lock_timeout call, in call order
+  def observe_lock_timeout_during
+    $lock_timeout_observations = []
+    result = yield
+    [result, $lock_timeout_observations]
+  ensure
+    $lock_timeout_observations = nil
+  end
+
+  # return [block_result, observations] with one server timeout reading
+  # per validate_constraint call, including foreign key and check validation
 
   def capture_statements
     statements = []
@@ -161,6 +258,14 @@ class Minitest::Test
   def lock_option?
     (mysql? || mariadb?) && ar_version >= 8.2
   end
+
+  # Use the real connection to test adapter methods without running a migration.
+  def adapter_for_current_connection
+    connection = ActiveRecord::Base.connection
+    checker = Object.new
+    checker.define_singleton_method(:connection) { connection }
+    StrongMigrations::Adapters::PostgreSQLAdapter.new(checker)
+  end
 end
 
 StrongMigrations.add_check do |method, args|
@@ -182,6 +287,39 @@ module AnalyzeFailures
 end
 StrongMigrations::Adapters::PostgreSQLAdapter.prepend(AnalyzeFailures)
 
+$lock_timeout_observations = nil
+
+# read the server timeout inside each override, before running the statement
+module LockTimeoutDuringObserver
+  def with_lock_timeout(timeout, &block)
+    return super unless $lock_timeout_observations
+    super(timeout) do
+      $lock_timeout_observations << connection.uncached { select_all("SHOW lock_timeout") }.first["lock_timeout"]
+      block.call
+    end
+  end
+end
+StrongMigrations::Adapters::PostgreSQLAdapter.prepend(LockTimeoutDuringObserver)
+
+
 Dir.glob("migrations/*.rb", base: __dir__).sort.each do |file|
   require_relative file
+end
+
+# Provide a minimal Checker substitute for testing adapter predicates.
+# Pass nil as the status to simulate a driver without transaction status support.
+class FakeChecker
+  FakeRawConnection = Struct.new(:transaction_status)
+
+  def initialize(status, open_transactions: 0)
+    @status = status
+    @open_transactions = open_transactions
+  end
+
+  def connection
+    raw = @status.nil? ? Object.new : FakeRawConnection.new(@status)
+    FakeConnection.new(raw, @open_transactions)
+  end
+
+  FakeConnection = Struct.new(:raw_connection, :open_transactions)
 end

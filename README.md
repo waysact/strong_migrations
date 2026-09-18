@@ -974,6 +974,29 @@ ALTER ROLE myuser SET statement_timeout = '1h';
 
 Note: If you use a connection pooler like PgBouncer in transaction mode, you must set timeouts on the database user.
 
+### Non-blocking statements
+
+Note: This feature is experimental.
+
+On Postgres, concurrent index operations can wait for other transactions without directly blocking reads or writes. A lock timeout can cancel a concurrent index build and leave an invalid index.
+
+Set a separate lock timeout for non-blocking statements with:
+
+```ruby
+StrongMigrations.non_blocking_lock_timeout = 0
+```
+
+Use seconds or a Postgres duration string, like `"2s"`. Set `0` for no lock timeout. The default is `nil`, which keeps the normal `lock_timeout`. This option applies to:
+
+- `add_index` and `remove_index` with `algorithm: :concurrently`
+- `ANALYZE` after adding an index with `auto_analyze` enabled
+
+This option does not apply to `add_reference` with `index: {algorithm: :concurrently}`, since adding the column blocks reads and writes. The subsequent `ANALYZE` can still use this option.
+
+Note: These statements hold `SHARE UPDATE EXCLUSIVE`, which blocks DDL that needs `ACCESS EXCLUSIVE`. Application queries can queue behind that DDL, so a finite timeout can still help.
+
+Note: This option does not support connection poolers like PgBouncer in transaction mode. Setting, using, and restoring the timeout can happen on different connections. The override may not apply or may remain on a pooled connection.
+
 ## App Timeouts
 
 We recommend adding timeouts to `config/database.yml` to prevent connections from hanging and individual queries from taking up too many resources in controllers, jobs, the Rails console, and other places.

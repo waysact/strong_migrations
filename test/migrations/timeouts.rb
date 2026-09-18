@@ -95,3 +95,74 @@ class CheckLockTimeoutRetriesCommitDbTransaction < TestMigration
     add_column :users, :nice, :boolean
   end
 end
+
+class CheckLockTimeoutAfterConcurrentIndex < TestMigration
+  disable_ddl_transaction!
+
+  def up
+    add_index :users, :name, algorithm: :concurrently
+    $lock_timeout_after = connection.select_all("SHOW lock_timeout").first["lock_timeout"]
+  end
+
+  def down
+    remove_index :users, :name, algorithm: :concurrently
+  end
+end
+
+
+
+
+
+
+
+
+class AddUniqueIndexConcurrentlyDupCheck < TestMigration
+  disable_ddl_transaction!
+
+  def change
+    add_index :users, :name, unique: true, algorithm: :concurrently, name: "index_users_on_name_dup_check"
+  end
+end
+
+class AddIndexSafeByDefault < TestMigration
+  def change
+    add_index :users, :name
+  end
+end
+
+class RevertAddIndexConcurrently < TestMigration
+  disable_ddl_transaction!
+
+  def up
+    revert do
+      add_index :users, :name, algorithm: :concurrently
+    end
+  end
+end
+
+class AddIndexConcurrentlyMissingColumn < TestMigration
+  disable_ddl_transaction!
+
+  def change
+    add_index :users, :missing_column, algorithm: :concurrently
+  end
+end
+
+class AddColumnAndNonConcurrentIndexWithAutoAnalyze < TestMigration
+  def up
+    add_column :devices, :extra, :string
+    safety_assured { add_index :users, :name }
+  end
+
+  def down
+    safety_assured { remove_index :users, :name }
+    remove_column :devices, :extra
+  end
+end
+
+
+
+
+# remove_index checks held locks without issuing a DROP
+# User.lock takes a row lock without clearing earlier query cache entries
+
