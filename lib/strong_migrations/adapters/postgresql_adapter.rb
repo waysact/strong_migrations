@@ -1,6 +1,10 @@
 module StrongMigrations
   module Adapters
     class PostgreSQLAdapter < AbstractAdapter
+      # PQTRANS_INTRANS and PQTRANS_INERROR from libpq's public enum.
+      # Use numeric values because the pg gem may load after this file.
+      IN_TRANSACTION_STATUSES = [2, 3].freeze
+
       def name
         "PostgreSQL"
       end
@@ -28,12 +32,57 @@ module StrongMigrations
         set_timeout("transaction_timeout", timeout) if server_version >= Gem::Version.new("17")
       end
 
-      def set_lock_timeout(timeout)
-        set_timeout("lock_timeout", timeout)
+      def set_lock_timeout(timeout, local: false)
+        set_timeout("lock_timeout", timeout, local: local)
+      end
+
+      # preserve the server's timeout, including role settings and nested overrides
+      #
+      # The block must not change transaction state. The override and restore
+      # both use the state captured before the block. A commit would discard
+      # SET LOCAL during the block; a rollback could undo a session-level
+      # restore. Restoring the timeout afterward cannot fix either case.
+      # Checker only wraps statements that leave transaction state unchanged.
+      def with_lock_timeout(timeout)
+        return yield if timeout.nil?
+
+        # SHOW starts any lazy Active Record transaction before we check its status
+        previous = connection.uncached { select_all("SHOW lock_timeout") }.first["lock_timeout"]
+        # use SET LOCAL inside a transaction so restoring a transaction-local value
+        # cannot make it persist after commit
+        local = server_in_transaction?
+        # Track whether this block raised. $! may refer to an exception from
+        # an enclosing rescue clause even when this block succeeds.
+        operation_failed = false
+        # Apply the override inside begin so the ensure clause can restore it
+        # if execution is interrupted before yield.
+        applied = false
+        begin
+          set_lock_timeout(timeout, local: local)
+          applied = true
+          yield
+        rescue Exception
+          operation_failed = true
+          raise
+        ensure
+          # Preserve the operation's error so retry logic and callers can
+          # rescue LockWaitTimeout. Raise a restore error only if the operation
+          # succeeded.
+          begin
+            set_lock_timeout(previous, local: local) if applied
+          rescue StandardError => e
+            raise unless operation_failed
+
+            # Warn because the session-level override may remain in effect
+            # if the connection survives.
+            warn "[strong_migrations] Failed to restore lock_timeout: #{e.message}" unless local
+          end
+        end
       end
 
       def check_lock_timeout(limit)
-        lock_timeout = connection.select_all("SHOW lock_timeout").first["lock_timeout"]
+        # bypass the query cache since SET does not invalidate cached timeout reads
+        lock_timeout = connection.uncached { select_all("SHOW lock_timeout") }.first["lock_timeout"]
         lock_timeout_sec = timeout_to_sec(lock_timeout)
         if lock_timeout_sec == 0
           warn "[strong_migrations] DANGER: No lock timeout set"
@@ -145,6 +194,29 @@ module StrongMigrations
         select_all(query.squish).any?
       end
 
+      # Report whether this session holds locks that can block application queries.
+      def application_blocking_lock_held?
+        # only allow relation locks that cannot block application reads or writes
+        # RowExclusiveLock and RowShareLock can indicate row locks held by writes
+        # or locking reads, even when the relation lock itself does not block queries
+        # foreign key validation also holds RowShareLock until the transaction ends
+        # only check granted relation locks, not locks on the transaction's own ID
+        query = <<~SQL
+          SELECT
+            1
+          FROM
+            pg_locks
+          WHERE
+            locktype = 'relation' AND
+            mode NOT IN ('AccessShareLock', 'ShareUpdateExclusiveLock') AND
+            pid = pg_backend_pid() AND
+            granted
+          LIMIT 1
+        SQL
+        # bypass the query cache since locking reads do not clear cached lock state
+        connection.uncached { select_all(query.squish) }.any?
+      end
+
       # only check in non-developer environments (where actual server version is used)
       def index_corruption?
         server_version >= Gem::Version.new("14.0") &&
@@ -172,13 +244,67 @@ module StrongMigrations
         connection.check_constraints(table).select { |c| /\b#{Regexp.escape(column.to_s)}\b/.match?(c.expression) }
       end
 
+      # returns pg_constraint.contype, or nil if the constraint or table does not exist
+      def constraint_type(table, name)
+        # to_regclass returns NULL instead of raising for a name that does not resolve -
+        # an eligibility check must never be what breaks a migration
+        query = <<~SQL
+          SELECT contype
+          FROM pg_constraint
+          WHERE conrelid = to_regclass(#{connection.quote(connection.quote_table_name(table.to_s))})
+            AND conname = #{connection.quote(name.to_s)}
+        SQL
+        # bypass the query cache so each statement checks the current constraint type
+        connection.uncached { select_all(query.squish) }.first&.fetch("contype")
+      end
+
+      # The name distinguishes the server's state from the Active Record
+      # count checked by SafeMethods#in_transaction?; Checker uses both methods.
+      def server_in_transaction?
+        # Query the server because direct BEGIN and COMMIT calls leave Active
+        # Record's transaction count unchanged. SafeMethods#disable_transaction
+        # commits the DDL transaction, then safe_change_column_null starts a new
+        # transaction with begin_db_transaction. The count stays at 1 even while
+        # the server is between transactions.
+        #
+        # Subtracting the committed transaction from the count would also hide
+        # the new transaction. After a lock timeout, a statement retry would then
+        # fail with PG::InFailedSqlTransaction. An accurate count would need to
+        # track every direct BEGIN and COMMIT issued by the gem.
+        #
+        # raw_connection marks the connection dirty and disables lazy
+        # transactions. This prevents automatic verification and reconnection
+        # with state restoration until the next checkout. Use the public method
+        # despite these side effects to avoid depending on @raw_connection.
+        raw = connection.raw_connection
+        if raw.respond_to?(:transaction_status)
+          # Only INTRANS and INERROR identify a transaction block. ACTIVE means
+          # a command is running; UNKNOWN means the connection is invalid.
+          # Treating either as a transaction could select SET LOCAL outside a
+          # transaction, where Postgres ignores it.
+          IN_TRANSACTION_STATUSES.include?(raw.transaction_status)
+        else
+          # Fall back to Active Record when the driver cannot report transaction
+          # status, as with JDBC. After a direct COMMIT, the stale count can
+          # cause us to use SET LOCAL outside a transaction, where the server
+          # ignores the timeout override. Keep this conservative fallback:
+          # reporting no transaction could allow statement retries inside
+          # safe_change_column_null's aborted transaction and fail the migration.
+          connection.open_transactions > 0
+        end
+      end
+
       private
 
-      def set_timeout(setting, timeout)
+      def set_timeout(setting, timeout, local: false)
         # use ceil to prevent no timeout for values under 1 ms
         timeout = (timeout.to_f * 1000).ceil unless timeout.is_a?(String)
 
-        select_all("SET #{setting} TO #{connection.quote(timeout)}")
+        scope = local ? "LOCAL" : nil
+        sql = ["SET", scope, "#{setting} TO #{connection.quote(timeout)}"].compact.join(" ")
+
+        # bypass the query cache so every SET reaches the server
+        connection.uncached { select_all(sql) }
       end
 
       # units: https://www.postgresql.org/docs/current/config-setting.html
