@@ -980,10 +980,13 @@ Note: This feature is experimental.
 
 On Postgres, concurrent index operations can wait for other transactions without directly blocking reads or writes. A lock timeout can cancel a concurrent index build and leave an invalid index.
 
-Set a separate lock timeout for non-blocking statements with:
+Set a separate lock timeout for non-blocking statements. It supplements `lock_timeout` and should be significantly longer. We recommend:
 
 ```ruby
-StrongMigrations.non_blocking_lock_timeout = 0
+StrongMigrations.lock_timeout = 10.seconds
+StrongMigrations.statement_timeout = 1.hour
+StrongMigrations.non_blocking_lock_timeout = 10.minutes
+StrongMigrations.lock_timeout_retries = 3
 ```
 
 Specify the timeout as a number of seconds or a Postgres duration string, such as `"2s"`. Postgres interprets strings without a unit as milliseconds. Set the timeout to `0` to disable it, or leave it at the default, `nil`, to keep the normal `lock_timeout`.
