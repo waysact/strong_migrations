@@ -1008,6 +1008,8 @@ StrongMigrations.lock_timeout = 10.seconds
 StrongMigrations.statement_timeout = 1.hour
 StrongMigrations.non_blocking_lock_timeout = 10.minutes
 StrongMigrations.lock_timeout_retries = 3
+# let a retried concurrent index build remove the invalid index left behind
+StrongMigrations.remove_invalid_indexes = true
 ```
 
 Specify the timeout as a number of seconds or a Postgres duration string, such as `"2s"`. Postgres interprets strings without a unit as milliseconds. Set the timeout to `0` to disable it, or leave it at the default, `nil`, to keep the normal `lock_timeout`.
