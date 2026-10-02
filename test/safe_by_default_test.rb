@@ -292,6 +292,25 @@ class SafeByDefaultTest < Minitest::Test
     User.delete_all
   end
 
+  # without a DDL transaction, nothing else rolls back the transaction that
+  # safe_change_column_null opens
+  def test_change_column_null_invalid_no_transaction
+    skip unless postgresql?
+
+    user = User.create!
+
+    error = assert_raises(ActiveRecord::StatementInvalid) do
+      migrate ChangeColumnNullNoTransaction
+    end
+    assert_kind_of PG::CheckViolation, error.cause
+
+    user.update!(name: "Test")
+
+    assert_safe ChangeColumnNullNoTransaction
+  ensure
+    User.delete_all
+  end
+
   def test_change_column_null_long_name
     skip unless postgresql?
 

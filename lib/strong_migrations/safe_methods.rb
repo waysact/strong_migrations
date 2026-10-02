@@ -119,9 +119,17 @@ module StrongMigrations
           disable_transaction
 
           connection.begin_db_transaction
-          @migration.validate_check_constraint(*validate_args, **validate_options)
-          @migration.change_column_null(*change_args)
-          @migration.remove_check_constraint(*remove_args, **remove_options)
+          begin
+            @migration.validate_check_constraint(*validate_args, **validate_options)
+            @migration.change_column_null(*change_args)
+            @migration.remove_check_constraint(*remove_args, **remove_options)
+          rescue Exception
+            # Without a DDL transaction, nothing else rolls back this transaction.
+            # Later statements, such as releasing the migration lock, would fail
+            # in the aborted transaction and hide the original error.
+            connection.rollback_db_transaction
+            raise
+          end
           connection.commit_db_transaction
         end
         dir.down do
