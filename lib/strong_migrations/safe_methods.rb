@@ -119,9 +119,25 @@ module StrongMigrations
           disable_transaction
 
           connection.begin_db_transaction
-          @migration.validate_check_constraint(*validate_args, **validate_options)
-          @migration.change_column_null(*change_args)
-          @migration.remove_check_constraint(*remove_args, **remove_options)
+          begin
+            @migration.validate_check_constraint(*validate_args, **validate_options)
+            @migration.change_column_null(*change_args)
+            @migration.remove_check_constraint(*remove_args, **remove_options)
+          rescue Exception => e
+            # Without a DDL transaction, nothing else rolls back this transaction.
+            # Later statements, such as releasing the migration lock, would fail
+            # in the aborted transaction and hide the original error. With a DDL
+            # transaction, Active Record rolls back; a second rollback would
+            # make Postgres warn that no transaction is in progress.
+            unless in_transaction?
+              begin
+                connection.rollback_db_transaction
+              rescue StandardError
+                # keep the original error
+              end
+            end
+            raise e
+          end
           connection.commit_db_transaction
         end
         dir.down do

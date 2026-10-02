@@ -24,6 +24,10 @@ module StrongMigrations
         # do nothing
       end
 
+      def with_lock_timeout(timeout)
+        yield
+      end
+
       def check_lock_timeout(limit)
         # do nothing
       end
@@ -45,6 +49,10 @@ module StrongMigrations
       end
 
       def max_constraint_name_length
+      end
+
+      def server_in_transaction?
+        connection.open_transactions > 0
       end
 
       private

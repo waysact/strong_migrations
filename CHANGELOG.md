@@ -1,3 +1,10 @@
+## 2.9.0 (unreleased)
+
+- Added experimental `non_blocking_lock_timeout` option
+- Changed `auto_analyze` to warn instead of failing the migration on lock timeouts
+- Fixed `safe_by_default` hiding errors from `change_column_null` without a DDL transaction
+- Fixed lock timeout retries after `safe_by_default` commits the transaction
+
 ## 2.8.0 (2026-05-14)
 
 - Added check for `rename_enum_value`

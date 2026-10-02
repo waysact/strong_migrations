@@ -974,6 +974,64 @@ ALTER ROLE myuser SET statement_timeout = '1h';
 
 Note: If you use a connection pooler like PgBouncer in transaction mode, you must set timeouts on the database user.
 
+### Lock Timeout Retries
+
+Note: This feature is experimental.
+
+There’s the option to automatically retry statements for migrations when the lock timeout is reached. Here’s how it works:
+
+- If a lock timeout happens outside a transaction, the statement is retried
+- If it happens inside the DDL transaction, the entire migration is retried (only applicable to Postgres)
+
+Add to `config/initializers/strong_migrations.rb`:
+
+```ruby
+StrongMigrations.lock_timeout_retries = 3
+```
+
+Set the delay between retries with:
+
+```ruby
+StrongMigrations.lock_timeout_retry_delay = 10.seconds
+```
+
+### Non-blocking statements
+
+Note: This feature is experimental.
+
+On Postgres, concurrent index operations can wait for other transactions without directly blocking reads or writes. A lock timeout can cancel a concurrent index build and leave an invalid index.
+
+Set a separate lock timeout for non-blocking statements. It supplements `lock_timeout` and should be significantly longer. We recommend:
+
+```ruby
+StrongMigrations.lock_timeout = 10.seconds
+StrongMigrations.statement_timeout = 1.hour
+StrongMigrations.non_blocking_lock_timeout = 10.minutes
+StrongMigrations.lock_timeout_retries = 3
+# let a retried concurrent index build remove the invalid index left behind
+StrongMigrations.remove_invalid_indexes = true
+```
+
+Specify the timeout as a number of seconds or a Postgres duration string, such as `"2s"`. Postgres interprets strings without a unit as milliseconds. Set the timeout to `0` to disable it, or leave it at the default, `nil`, to keep the normal `lock_timeout`.
+
+This option applies only to PostgreSQL; MySQL and MariaDB ignore it. It covers:
+
+- `add_index` and `remove_index` with `algorithm: :concurrently`
+- `validate_check_constraint` and `validate_constraint` for check constraints
+- `ANALYZE` after adding an index with `auto_analyze` enabled
+
+This option does not apply to `add_reference` with `index: {algorithm: :concurrently}`, since adding the column blocks reads and writes. The subsequent `ANALYZE` can still use this option.
+
+Foreign key validation can take row locks, so `validate_foreign_key` and `validate_constraint` for foreign keys always use the normal `lock_timeout`. The `lock_timeout_retries` option still applies.
+
+Note: Setting this option to `0` disables lock timeouts, so `lock_timeout_retries` cannot retry the statement. If `statement_timeout` is set, Postgres cancels the statement when that limit is reached. This query timeout is not retried, and canceling a concurrent index build leaves an invalid index. Use a positive lock timeout shorter than `statement_timeout` to allow lock timeout retries.
+
+Note: These statements hold `SHARE UPDATE EXCLUSIVE`, which blocks DDL that needs `ACCESS EXCLUSIVE`. Application queries can queue behind that DDL, so a finite timeout can still help.
+
+Note: This option does not support connection poolers like PgBouncer in transaction mode. Setting, using, and restoring the timeout can happen on different connections. The override may not apply or may remain on a pooled connection.
+
+Note: Statements also keep the normal timeout if the transaction already holds locks that can block application queries. Foreign key validation leaves a `ROW SHARE` lock until the transaction ends, which also prevents later statements from using this option.
+
 ## App Timeouts
 
 We recommend adding timeouts to `config/database.yml` to prevent connections from hanging and individual queries from taking up too many resources in controllers, jobs, the Rails console, and other places.
@@ -1027,27 +1085,6 @@ To automatically remove the invalid index when the migration runs again, use:
 StrongMigrations.remove_invalid_indexes = true
 ```
 
-## Lock Timeout Retries
-
-Note: This feature is experimental.
-
-There’s the option to automatically retry statements for migrations when the lock timeout is reached. Here’s how it works:
-
-- If a lock timeout happens outside a transaction, the statement is retried
-- If it happens inside the DDL transaction, the entire migration is retried (only applicable to Postgres)
-
-Add to `config/initializers/strong_migrations.rb`:
-
-```ruby
-StrongMigrations.lock_timeout_retries = 3
-```
-
-Set the delay between retries with:
-
-```ruby
-StrongMigrations.lock_timeout_retry_delay = 10.seconds
-```
-
 ## Existing Migrations
 
 To mark migrations as safe that were created before installing this gem, create an initializer with:
@@ -1083,6 +1120,8 @@ Analyze tables automatically (to update planner statistics) after an index is ad
 ```ruby
 StrongMigrations.auto_analyze = true
 ```
+
+If `ANALYZE` reaches the lock timeout, the migration continues with a warning and the statement is not retried. Run `ANALYZE` manually to update the statistics.
 
 ## Faster Migrations
 

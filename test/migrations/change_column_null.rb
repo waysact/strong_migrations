@@ -4,6 +4,18 @@ class ChangeColumnNull < TestMigration
   end
 end
 
+class ChangeColumnNullNoTransaction < TestMigration
+  disable_ddl_transaction!
+
+  def up
+    change_column_null :users, :name, false
+  end
+
+  def down
+    change_column_null :users, :name, true
+  end
+end
+
 class ChangeColumnNullConstraint < TestMigration
   def up
     safety_assured do

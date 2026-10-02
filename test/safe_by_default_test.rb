@@ -292,6 +292,76 @@ class SafeByDefaultTest < Minitest::Test
     User.delete_all
   end
 
+  # Active Record rolls back the DDL transaction itself, so a second rollback
+  # would make Postgres warn that no transaction is in progress
+  def test_change_column_null_invalid_db_warnings_raise
+    skip unless postgresql?
+
+    previous = ActiveRecord.db_warnings_action
+    ActiveRecord.db_warnings_action = :raise
+    # the adapter installs its notice receiver when it connects
+    ActiveRecord::Base.connection.reconnect!
+    User.create!
+
+    error = assert_raises(ActiveRecord::StatementInvalid) do
+      migrate ChangeColumnNull
+    end
+    assert_kind_of PG::CheckViolation, error.cause
+  ensure
+    if postgresql?
+      # disconnect first, since the notice receiver calls the action
+      ActiveRecord::Base.connection_pool.disconnect!
+      # the setter rejects nil, the default
+      ActiveRecord.instance_variable_set(:@db_warnings_action, previous)
+      User.delete_all
+      # the constraint was committed before validation failed
+      ActiveRecord::Base.connection.execute('ALTER TABLE "users" DROP CONSTRAINT IF EXISTS "users_name_null"')
+    end
+  end
+
+  # without a DDL transaction, nothing else rolls back the transaction that
+  # safe_change_column_null opens
+  def test_change_column_null_invalid_no_transaction
+    skip unless postgresql?
+
+    user = User.create!
+
+    error = assert_raises(ActiveRecord::StatementInvalid) do
+      migrate ChangeColumnNullNoTransaction
+    end
+    assert_kind_of PG::CheckViolation, error.cause
+
+    user.update!(name: "Test")
+
+    assert_safe ChangeColumnNullNoTransaction
+  ensure
+    User.delete_all
+  end
+
+  # a failed rollback must not replace the original error - run the migration
+  # without Migrator, whose advisory unlock would fail in the aborted transaction
+  def test_change_column_null_invalid_no_transaction_rollback_fails
+    skip unless postgresql?
+
+    User.create!
+    connection = ActiveRecord::Base.connection
+    connection.define_singleton_method(:rollback_db_transaction) do
+      raise ActiveRecord::StatementInvalid, "rollback failed"
+    end
+
+    error = assert_raises(ActiveRecord::StatementInvalid) do
+      ChangeColumnNullNoTransaction.new.migrate(:up)
+    end
+    assert_kind_of PG::CheckViolation, error.cause
+  ensure
+    if postgresql?
+      connection.singleton_class.remove_method(:rollback_db_transaction)
+      connection.rollback_db_transaction
+      User.delete_all
+      connection.execute('ALTER TABLE "users" DROP CONSTRAINT IF EXISTS "users_name_null"')
+    end
+  end
+
   def test_change_column_null_long_name
     skip unless postgresql?
 
