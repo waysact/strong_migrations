@@ -272,6 +272,12 @@ module StrongMigrations
         # fail with PG::InFailedSqlTransaction. An accurate count would need to
         # track every direct BEGIN and COMMIT issued by the gem.
         #
+        # The count can also be too low, so a count of 0 cannot skip the query.
+        # In a migration with disable_ddl_transaction!, safe_change_column_null
+        # opens a transaction with begin_db_transaction and the count stays at 0.
+        # Treating that as no transaction would allow statement retries in the
+        # aborted transaction and select SET instead of SET LOCAL.
+        #
         # raw_connection marks the connection dirty and disables lazy
         # transactions. This prevents automatic verification and reconnection
         # with state restoration until the next checkout. Use the public method

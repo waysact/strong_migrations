@@ -111,6 +111,20 @@ class ChangeColumnNullLockTimeout < TestMigration
   end
 end
 
+# without a DDL transaction there is nothing to commit, so safe_change_column_null
+# opens its real transaction while Active Record's transaction count stays at zero
+class ChangeColumnNullNoDdlTransactionLockTimeout < TestMigration
+  disable_ddl_transaction!
+
+  def up
+    change_column_null :users, :name, false
+  end
+
+  def down
+    change_column_null :users, :name, true
+  end
+end
+
 # an ordinary Active Record transaction opened after safe_by_default's raw commit
 # (inside the first transaction block, whose exit resyncs Active Record's
 # transaction count back to zero) - a lock timeout on a statement inside the

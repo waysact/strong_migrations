@@ -363,6 +363,42 @@ class TimeoutsTest < Minitest::Test
     end
   end
 
+  # the same real transaction without a DDL transaction - Active Record's
+  # transaction count stays at zero while the server is inside the transaction
+  # that begin_db_transaction opened, so the count cannot rule out a transaction
+  def test_lock_timeout_retries_change_column_null_real_transaction_no_ddl_transaction
+    skip unless postgresql?
+
+    connection = ActiveRecord::Base.connection
+    # created up front so the migration skips add_check_constraint, which runs
+    # outside the transaction and would otherwise time out first
+    connection.execute('ALTER TABLE "users" ADD CONSTRAINT "users_name_null" CHECK ("name" IS NOT NULL) NOT VALID')
+
+    statements = nil
+    with_option(:safe_by_default, true) do
+      with_statement_timeout(NORMAL_LOCK_TIMEOUT * 20) do
+        with_lock_timeout_retries do
+          statements = capture_statements do
+            error = assert_raises(ActiveRecord::LockWaitTimeout) do
+              migrate ChangeColumnNullNoDdlTransactionLockTimeout
+            end
+            refute_kind_of PG::InFailedSqlTransaction, error.cause
+          end
+        end
+      end
+    end
+
+    # a statement retry would repeat the statement in the aborted transaction
+    assert_equal 1, statements.count { |s| s.include?("SET NOT NULL") }
+  ensure
+    if postgresql?
+      connection = ActiveRecord::Base.connection
+      name_column = connection.columns(:users).find { |c| c.name == "name" }
+      connection.change_column_null :users, :name, true if name_column && !name_column.null
+      connection.execute('ALTER TABLE "users" DROP CONSTRAINT IF EXISTS "users_name_null"')
+    end
+  end
+
   # the regression above holds the lock for the whole migration, so its assertion
   # still passes if migration-level retries stop working - the first timeout
   # raises the same exception class - so also release the lock when the first
