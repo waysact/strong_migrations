@@ -308,13 +308,15 @@ class SafeByDefaultTest < Minitest::Test
     end
     assert_kind_of PG::CheckViolation, error.cause
   ensure
-    # the setter rejects nil, the default
-    # disconnect first, since the notice receiver calls the action
-    ActiveRecord::Base.connection_pool.disconnect!
-    ActiveRecord.instance_variable_set(:@db_warnings_action, previous)
-    User.delete_all
-    # the constraint was committed before validation failed
-    ActiveRecord::Base.connection.execute('ALTER TABLE "users" DROP CONSTRAINT IF EXISTS "users_name_null"')
+    if postgresql?
+      # disconnect first, since the notice receiver calls the action
+      ActiveRecord::Base.connection_pool.disconnect!
+      # the setter rejects nil, the default
+      ActiveRecord.instance_variable_set(:@db_warnings_action, previous)
+      User.delete_all
+      # the constraint was committed before validation failed
+      ActiveRecord::Base.connection.execute('ALTER TABLE "users" DROP CONSTRAINT IF EXISTS "users_name_null"')
+    end
   end
 
   # without a DDL transaction, nothing else rolls back the transaction that
