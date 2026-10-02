@@ -974,6 +974,27 @@ ALTER ROLE myuser SET statement_timeout = '1h';
 
 Note: If you use a connection pooler like PgBouncer in transaction mode, you must set timeouts on the database user.
 
+### Lock Timeout Retries
+
+Note: This feature is experimental.
+
+There’s the option to automatically retry statements for migrations when the lock timeout is reached. Here’s how it works:
+
+- If a lock timeout happens outside a transaction, the statement is retried
+- If it happens inside the DDL transaction, the entire migration is retried (only applicable to Postgres)
+
+Add to `config/initializers/strong_migrations.rb`:
+
+```ruby
+StrongMigrations.lock_timeout_retries = 3
+```
+
+Set the delay between retries with:
+
+```ruby
+StrongMigrations.lock_timeout_retry_delay = 10.seconds
+```
+
 ### Non-blocking statements
 
 Note: This feature is experimental.
@@ -1060,27 +1081,6 @@ To automatically remove the invalid index when the migration runs again, use:
 
 ```ruby
 StrongMigrations.remove_invalid_indexes = true
-```
-
-## Lock Timeout Retries
-
-Note: This feature is experimental.
-
-There’s the option to automatically retry statements for migrations when the lock timeout is reached. Here’s how it works:
-
-- If a lock timeout happens outside a transaction, the statement is retried
-- If it happens inside the DDL transaction, the entire migration is retried (only applicable to Postgres)
-
-Add to `config/initializers/strong_migrations.rb`:
-
-```ruby
-StrongMigrations.lock_timeout_retries = 3
-```
-
-Set the delay between retries with:
-
-```ruby
-StrongMigrations.lock_timeout_retry_delay = 10.seconds
 ```
 
 ## Existing Migrations
