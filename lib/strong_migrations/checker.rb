@@ -122,8 +122,11 @@ module StrongMigrations
         table = resolved_table_name(args[0])
         # apply the ANALYZE timeout separately so add_reference keeps its normal timeout
         with_lock_timeout_for(:analyze, [table]) do
-          # retry ANALYZE separately to avoid repeating a successful index build
-          maybe_retry_lock_timeouts(method) { adapter.analyze_table(table) }
+          adapter.analyze_table(table)
+        rescue ActiveRecord::LockWaitTimeout
+          # ANALYZE only refreshes planner statistics, so keep the completed
+          # index build instead of failing or retrying the migration
+          warn "[strong_migrations] Lock timeout while analyzing #{table}. Run ANALYZE manually to update planner statistics."
         end
       end
 

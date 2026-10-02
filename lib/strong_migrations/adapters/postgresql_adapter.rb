@@ -92,7 +92,20 @@ module StrongMigrations
       end
 
       def analyze_table(table)
-        connection.execute "ANALYZE #{connection.quote_table_name(table.to_s)}"
+        sql = "ANALYZE #{connection.quote_table_name(table.to_s)}"
+        return connection.execute(sql) unless server_in_transaction?
+
+        # A lock timeout aborts the enclosing transaction. Roll back to a
+        # savepoint so Checker can continue the migration after the timeout.
+        connection.execute("SAVEPOINT strong_migrations_analyze")
+        begin
+          connection.execute(sql)
+        rescue ActiveRecord::LockWaitTimeout
+          connection.execute("ROLLBACK TO SAVEPOINT strong_migrations_analyze")
+          connection.execute("RELEASE SAVEPOINT strong_migrations_analyze")
+          raise
+        end
+        connection.execute("RELEASE SAVEPOINT strong_migrations_analyze")
       end
 
       def add_column_default_safe?

@@ -1119,6 +1119,8 @@ Analyze tables automatically (to update planner statistics) after an index is ad
 StrongMigrations.auto_analyze = true
 ```
 
+If `ANALYZE` reaches the lock timeout, the migration continues with a warning and the statement is not retried. Run `ANALYZE` manually to update the statistics.
+
 ## Faster Migrations
 
 Only dump the schema when adding a new migration. If you use Git, add to the end of your `Rakefile`:

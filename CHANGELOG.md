@@ -1,7 +1,7 @@
 ## 2.9.0 (unreleased)
 
 - Added experimental `non_blocking_lock_timeout` option
-- Added retries for `ANALYZE` when `lock_timeout_retries` is set
+- Changed `auto_analyze` to warn instead of failing the migration on lock timeouts
 - Fixed lock timeout retries after `safe_by_default` commits the transaction
 
 ## 2.8.0 (2026-05-14)

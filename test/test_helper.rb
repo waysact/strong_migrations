@@ -404,7 +404,7 @@ $analyze_lock_rendezvous = nil
 # let with_lock_released_on_retry(defer_until_analyze: true) delay taking its
 # lock until immediately before a real ANALYZE reaches the server, then wait
 # for confirmation that the lock is actually held before letting it through -
-# consumed once, so retried ANALYZE calls pass straight through
+# consumed once, so later ANALYZE calls pass straight through
 module AnalyzeLockRendezvous
   def analyze_table(table)
     if (rendezvous = $analyze_lock_rendezvous)

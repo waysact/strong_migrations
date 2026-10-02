@@ -219,37 +219,55 @@ class TimeoutsTest < Minitest::Test
     migrate AddIndexConcurrently, direction: :down
   end
 
-  def test_lock_timeout_retries_analyze
+  def test_auto_analyze_lock_timeout
     skip unless postgresql?
 
     statements = nil
     with_auto_analyze do
       with_analyze_failures(1) do
-        with_lock_timeout_retries(lock: false) do
+        _, err = capture_io do
           statements = capture_statements do
+            migrate AddIndexConcurrently
+          end
+        end
+        assert_match "Lock timeout while analyzing users", err
+      end
+    end
+
+    assert_equal 1, $analyze_attempts
+    assert_equal 1, statements.count { |s| s.start_with?("CREATE INDEX") }
+    assert index_valid?("index_users_on_name")
+  ensure
+    migrate AddIndexConcurrently, direction: :down if postgresql?
+  end
+
+  # ANALYZE timeouts are not retried, even when lock_timeout_retries is set
+  def test_auto_analyze_lock_timeout_retries
+    skip unless postgresql?
+
+    with_auto_analyze do
+      with_analyze_failures(1) do
+        with_lock_timeout_retries(lock: false) do
+          capture_io do
             migrate AddIndexConcurrently
           end
         end
       end
     end
 
-    assert_equal 2, $analyze_attempts
-    assert_equal 1, statements.count { |s| s.start_with?("CREATE INDEX") }
+    assert_equal 1, $analyze_attempts
   ensure
     migrate AddIndexConcurrently, direction: :down if postgresql?
   end
 
-  # test_lock_timeout_retries_analyze injects the LockWaitTimeout, which only
-  # proves where the retry block sits, not that a real timeout (with the
-  # aborted-transaction state Postgres leaves behind) is handled correctly -
-  # this is the non-transactional path: a disable_ddl_transaction! migration,
-  # so only the ANALYZE statement itself is retried, not the index build
-  def test_lock_timeout_retries_analyze_real_lock_no_ddl_transaction
+  # test_auto_analyze_lock_timeout injects the LockWaitTimeout - a real timeout
+  # also checks the server state after it, here outside a transaction
+  def test_auto_analyze_lock_timeout_real_lock_no_ddl_transaction
     skip unless postgresql?
 
     migration = AddIndexConcurrently.new
     statements = nil
-    retries = nil
+    err = nil
     with_auto_analyze do
       with_lock_timeout_retries(lock: false) do
         with_statement_timeout(NORMAL_LOCK_TIMEOUT * 20) do
@@ -259,30 +277,32 @@ class TimeoutsTest < Minitest::Test
           # lock level and taking it any earlier would block the build too
           retries =
             with_lock_released_on_retry(migration, "users", mode: "SHARE UPDATE EXCLUSIVE", defer_until_analyze: true) do
-              statements = capture_statements do
-                migrate migration
+              _, err = capture_io do
+                statements = capture_statements do
+                  migrate migration
+                end
               end
             end
+          assert_equal 0, retries
         end
       end
     end
 
-    assert_equal 1, retries
+    assert_match "Lock timeout while analyzing users", err
     assert_equal 1, statements.count { |s| s.start_with?("CREATE INDEX") }
+    assert index_valid?("index_users_on_name")
   ensure
     migrate AddIndexConcurrently, direction: :down if postgresql?
   end
 
-  # same gap as above, for the DDL-transaction path: an ordinary transactional
-  # migration, so a real ANALYZE timeout rolls back and replays the whole
-  # transaction, unlike the non-transactional path above where only the
-  # ANALYZE statement is retried
-  def test_lock_timeout_retries_analyze_real_lock_ddl_transaction
+  # the same for the DDL transaction - the timeout aborts the transaction, so
+  # ANALYZE must run in a savepoint for the migration to commit the index
+  def test_auto_analyze_lock_timeout_real_lock_ddl_transaction
     skip unless postgresql?
 
     migration = AddIndexNonConcurrentlyWithAutoAnalyze.new
     statements = nil
-    retries = nil
+    err = nil
     with_auto_analyze do
       with_lock_timeout_retries(lock: false) do
         with_statement_timeout(NORMAL_LOCK_TIMEOUT * 20) do
@@ -292,42 +312,53 @@ class TimeoutsTest < Minitest::Test
           # front here, since it never conflicts with the build
           retries =
             with_lock_released_on_retry(migration, "users", mode: "SHARE") do
-              statements = capture_statements do
-                migrate migration
+              _, err = capture_io do
+                statements = capture_statements do
+                  migrate migration
+                end
               end
             end
+          assert_equal 0, retries
         end
       end
     end
 
-    assert_equal 1, retries
-    # the whole transaction is rolled back and replayed, so unlike the
-    # non-transactional path, the index build itself is attempted twice
-    assert_equal 2, statements.count { |s| s.start_with?("CREATE INDEX") }
+    assert_match "Lock timeout while analyzing users", err
+    assert_equal 1, statements.count { |s| s.start_with?("CREATE INDEX") }
+    assert index_valid?("index_users_on_name")
   ensure
     migrate AddIndexNonConcurrentlyWithAutoAnalyze, direction: :down if postgresql?
   end
 
-  # safe_by_default commits without updating Active Record's transaction count
-  # retry only ANALYZE, since retrying the index build raises PG::DuplicateTable
-  def test_lock_timeout_retries_analyze_safe_by_default
+  # safe_by_default commits the DDL transaction without updating Active Record's
+  # transaction count - ANALYZE then runs outside a transaction, where a
+  # savepoint would raise an error
+  def test_auto_analyze_lock_timeout_real_lock_safe_by_default
     skip unless postgresql?
 
+    migration = AddIndexSafeByDefault.new
     statements = nil
+    err = nil
     with_option(:safe_by_default, true) do
       with_auto_analyze do
-        with_analyze_failures(1) do
-          with_lock_timeout_retries(lock: false) do
-            statements = capture_statements do
-              migrate AddIndexSafeByDefault
+        with_lock_timeout_retries(lock: false) do
+          with_statement_timeout(NORMAL_LOCK_TIMEOUT * 20) do
+            with_lock_released_on_retry(migration, "users", mode: "SHARE UPDATE EXCLUSIVE", defer_until_analyze: true) do
+              _, err = capture_io do
+                statements = capture_statements do
+                  migrate migration
+                end
+              end
             end
           end
         end
       end
     end
 
-    assert_equal 2, $analyze_attempts
+    assert_match "Lock timeout while analyzing users", err
+    refute statements.any? { |s| s.start_with?("SAVEPOINT strong_migrations_analyze") }
     assert_equal 1, statements.count { |s| s.start_with?("CREATE INDEX") }
+    assert index_valid?("index_users_on_name")
   ensure
     migrate AddIndexSafeByDefault, direction: :down if postgresql?
   end
@@ -992,33 +1023,6 @@ class TimeoutsTest < Minitest::Test
     migrate AddIndexConcurrently, direction: :down if postgresql?
   end
 
-  # exhausting ANALYZE retries must leave the successful index build intact
-  def test_non_blocking_lock_timeout_analyze_retries_exhausted
-    skip unless postgresql?
-
-    statements = nil
-    with_option(:non_blocking_lock_timeout, 0) do
-      with_auto_analyze do
-        with_analyze_failures(10) do
-          with_lock_timeout_retries(lock: false) do
-            statements = capture_statements do
-              assert_raises(ActiveRecord::LockWaitTimeout) do
-                migrate AddIndexConcurrently
-              end
-            end
-          end
-        end
-      end
-    end
-
-    # one initial attempt and two retries
-    assert_equal 3, $analyze_attempts
-    assert_equal 1, statements.count { |s| s.start_with?("CREATE INDEX") }
-    assert index_valid?("index_users_on_name")
-  ensure
-    migrate AddIndexConcurrently, direction: :down if postgresql?
-  end
-
   # a missing column makes CREATE INDEX fail without aborting a transaction
   # the session timeout must still be restored
   def test_non_blocking_lock_timeout_restores_after_non_transactional_error
@@ -1353,19 +1357,27 @@ class TimeoutsTest < Minitest::Test
   def test_non_blocking_lock_timeout_analyze_does_not_apply_after_access_exclusive_lock
     skip unless postgresql?
 
-    # the transaction rolls back both the column and index on a lock timeout
+    # the normal timeout makes ANALYZE time out and warn - the override would
+    # wait until the statement timeout and fail the migration instead
+    err = nil
     with_option(:non_blocking_lock_timeout, 0) do
       with_auto_analyze do
         with_lock_timeout_retries(lock: false) do
           with_statement_timeout(NORMAL_LOCK_TIMEOUT * 20) do
             with_locked_table("users", mode: "SHARE") do
-              assert_raises(ActiveRecord::LockWaitTimeout) do
+              _, err = capture_io do
                 migrate AddColumnAndNonConcurrentIndexWithAutoAnalyze
               end
             end
           end
         end
       end
+    end
+    assert_match "Lock timeout while analyzing users", err
+  ensure
+    # a failed migration rolls back, leaving nothing to remove
+    if postgresql? && ActiveRecord::Base.connection.column_exists?(:devices, :extra)
+      migrate AddColumnAndNonConcurrentIndexWithAutoAnalyze, direction: :down
     end
   end
 
