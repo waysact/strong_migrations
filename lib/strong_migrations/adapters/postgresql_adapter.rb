@@ -93,19 +93,24 @@ module StrongMigrations
 
       def analyze_table(table)
         sql = "ANALYZE #{connection.quote_table_name(table.to_s)}"
+        # Without transaction status (JDBC), server_in_transaction? falls back
+        # to Active Record's count. After safe_by_default commits the DDL
+        # transaction, it then reports a transaction, and SAVEPOINT fails
+        # outside one.
         return connection.execute(sql) unless server_in_transaction?
 
         # A lock timeout aborts the enclosing transaction. Roll back to a
         # savepoint so Checker can continue the migration after the timeout.
-        connection.execute("SAVEPOINT strong_migrations_analyze")
+        savepoint = "strong_migrations_analyze"
+        connection.create_savepoint(savepoint)
         begin
           connection.execute(sql)
         rescue ActiveRecord::LockWaitTimeout
-          connection.execute("ROLLBACK TO SAVEPOINT strong_migrations_analyze")
-          connection.execute("RELEASE SAVEPOINT strong_migrations_analyze")
+          connection.exec_rollback_to_savepoint(savepoint)
+          connection.release_savepoint(savepoint)
           raise
         end
-        connection.execute("RELEASE SAVEPOINT strong_migrations_analyze")
+        connection.release_savepoint(savepoint)
       end
 
       def add_column_default_safe?

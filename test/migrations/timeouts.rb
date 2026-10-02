@@ -215,6 +215,20 @@ class AddUniqueIndexConcurrentlyDupCheck < TestMigration
   end
 end
 
+# record the session lock_timeout after ANALYZE, before the migration ends
+class AddIndexConcurrentlyThenShowLockTimeout < TestMigration
+  disable_ddl_transaction!
+
+  def up
+    add_index :users, :name, algorithm: :concurrently
+    $lock_timeout_after_analyze = connection.select_value("SHOW lock_timeout")
+  end
+
+  def down
+    remove_index :users, :name, algorithm: :concurrently
+  end
+end
+
 class AddIndexSafeByDefault < TestMigration
   def change
     add_index :users, :name

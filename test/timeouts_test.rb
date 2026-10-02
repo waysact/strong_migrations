@@ -295,6 +295,34 @@ class TimeoutsTest < Minitest::Test
     migrate AddIndexConcurrently, direction: :down if postgresql?
   end
 
+  # the warning must not leave the non_blocking_lock_timeout override in effect
+  # for the rest of the migration
+  def test_auto_analyze_lock_timeout_restores_non_blocking_lock_timeout
+    skip unless postgresql?
+
+    migration = AddIndexConcurrentlyThenShowLockTimeout.new
+    $lock_timeout_after_analyze = nil
+    err = nil
+    with_option(:non_blocking_lock_timeout, NORMAL_LOCK_TIMEOUT * 2) do
+      with_auto_analyze do
+        with_lock_timeout_retries(lock: false) do
+          with_statement_timeout(NORMAL_LOCK_TIMEOUT * 20) do
+            with_lock_released_on_retry(migration, "users", mode: "SHARE UPDATE EXCLUSIVE", defer_until_analyze: true) do
+              _, err = capture_io do
+                migrate migration
+              end
+            end
+          end
+        end
+      end
+    end
+
+    assert_match "Lock timeout while analyzing users", err
+    assert_equal "100ms", $lock_timeout_after_analyze
+  ensure
+    migrate AddIndexConcurrentlyThenShowLockTimeout, direction: :down if postgresql?
+  end
+
   # the same for the DDL transaction - the timeout aborts the transaction, so
   # ANALYZE must run in a savepoint for the migration to commit the index
   def test_auto_analyze_lock_timeout_real_lock_ddl_transaction
